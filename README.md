@@ -1,1 +1,3 @@
-# Collection of Scripts for Chocobo Betting in Final Fantasy 7 - FF7
+# Chocobo Betting in Final Fantasy 7
+
+Notes and a collection of scripts
