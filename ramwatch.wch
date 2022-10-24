@@ -1,0 +1,17 @@
+SystemID PSX
+095DC8	b	h	1	MainRAM	random
+04A630	b	h	0	MainRAM	stones
+062E10	b	h	0	MainRAM	
+062E11	b	h	0	MainRAM	
+062E12	b	h	0	MainRAM	
+062E13	b	h	0	MainRAM	
+062E14	b	h	0	MainRAM	
+062E15	b	h	0	MainRAM	
+062E16	b	h	0	MainRAM	
+062E17	b	h	0	MainRAM	
+062E18	b	h	0	MainRAM	pointer
+09C540	b	u	0	MainRAM	stepid
+07173C	w	u	0	MainRAM	danger
+09D264	d	h	0	MainRAM	IGT
+051568	d	u	0	MainRAM	chocobo
+
