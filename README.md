@@ -1,3 +1,3 @@
 # Chocobo Betting in Final Fantasy 7
 
-Notes and a collection of scripts
+Random scripts used in analyzing the chocobo betting in ff7 from 1997
