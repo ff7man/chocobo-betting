@@ -92,17 +92,28 @@ def race(chocobos):
             else:
                 nothing +=1
     chocobos2.sort(key=lambda x: (x.val,-x.topspeed, -x.jockey))
-    success = 0
-    if chocobos2[0].place <3:
-        success +=1
-    if chocobos2[1].place <3:
-        success +=1
-    if len(chocobos2)> 2:
-        if chocobos2[2].place <3:
-            success += 1
+    
+    # check if we predicted the correct winners
+    guesses = []
+    c0 = chocobos2[0].place
+    c1 = chocobos2[1].place
+    c2 = 7
+    #c3 = 7
+    if len(chocobos2) >2:
+        c2 = chocobos2[2].place
+    guesses.append([c0,c1])
+    guesses.append([c0,c2])
+    if len(chocobos2) >2:
+        guesses.append([c1,c2])
+        
+    win = False
+    for guess in guesses:
+        if 0 in guess and 1 in guess:
+            win = True
+            
     #print("Predicted: "+str(chocobos2))
     #input("Hello")
-    if success >1:
+    if win:
         return 1
     else:
         #print("og: "+str(notchocobos2))
