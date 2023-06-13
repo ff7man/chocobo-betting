@@ -141,8 +141,7 @@ validation_dataset = dataset.shuffle(len(X_test)).batch(500)
 
 print("Start training..\n")
 # How many epochs to use here are trial and error. 
-# I found 11 seems to have a high precision value before dropping
-history = model.fit(train_dataset, epochs=11, validation_data=validation_dataset)
+history = model.fit(train_dataset, epochs=100, validation_data=validation_dataset)
 print("Done.")
 
 # Make predictions on the test set
