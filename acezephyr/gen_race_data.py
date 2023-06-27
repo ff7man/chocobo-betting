@@ -1,4 +1,7 @@
 # RE'd by AceZephyr
+# Generates chocobo stats and items for certain PSX frames when racing (Not betting)
+# Useful in finding what frames will give the items you are looking for in tas runs
+
 class RNG:
 
     def rng(self):
