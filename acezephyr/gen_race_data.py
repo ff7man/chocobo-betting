@@ -309,3 +309,4 @@ def generate_chocobo_race_data(rng=None, rank="C", _B747C=0xffffffff):
         tile_buffer_cards[swap2] = a2
 
     return {"items": reward_pool, "tile_cards": tile_buffer_cards, "names": names[1:6], "chocobo_data": chodata}
+print(generate_chocobo_race_data(RNG(1000), rank="A", _B747C=0xffffffff))
