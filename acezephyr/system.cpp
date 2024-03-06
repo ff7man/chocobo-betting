@@ -1902,8 +1902,8 @@ void System::FrameDone()
   // Generate any pending samples from the SPU before sleeping, this way we reduce the chances of underruns.
   // TODO: when running ahead, we can skip this (and the flush above)
   SPU::GeneratePendingSamples();
-
-  //mike
+  
+  //ff7man
   run_script();
 
   if (s_cheat_list)
