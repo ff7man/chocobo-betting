@@ -2,7 +2,7 @@
 
 ![PSX Chocobo Data Generator screenshot](screenshot.png)
 
-This tool runs a custom DuckStation build to farm PlayStation chocobo race data into CSV files. The CSV format matches the historical `ml/race.lua` data and can be imported into **[PSX Computed](../psxcomputed/)** to expand its cached winner database. No generated race data, emulator build, BIOS, game image, or save states are included here.
+This tool runs four isolated custom DuckStation workers in parallel to farm PlayStation chocobo race data into CSV files. It can collect data much faster than the previous BizHawk + Lua workflow. The CSV format matches the historical `ml/race.lua` data and can be imported into **[PSX Computed](../psxcomputed/)** to expand its cached winner database. No generated race data, emulator build, BIOS, game image, or save states are included here.
 
 ## What it generates
 
