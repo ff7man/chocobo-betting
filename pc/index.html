@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#252b1b" />
+    <title>Chocobo Race · PC Predictor</title>
+    <link rel="stylesheet" href="psx-theme.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body data-rank="B">
+    <div class="app-shell">
+      <main id="top" class="pc-app">
+        <a class="back-link" href="../">← All versions</a>
+
+        <section class="game-screen pc-game-screen" aria-label="PC Chocobo race seed finder">
+          <header class="game-title">
+            <span>Chocobo RACE Tool</span>
+            <label class="class-title">Class <span class="class-select-wrap"><select id="rank" name="rank" aria-label="Race class"><option value="C">C</option><option value="B" selected>B</option><option value="A">A</option><option value="S">S</option></select><span aria-hidden="true">⌄</span></span></label>
+          </header>
+
+          <section class="bet-board" aria-label="Bet pairs with prediction markers and prize badges">
+            <div id="pc-main-bet-grid" class="bet-grid"></div>
+          </section>
+
+          <section class="stats-board pc-observed-stats" aria-label="First chocobo data to find">
+            <label class="stat-line"><span>Top Speed</span><span class="select-wrap"><input id="pc-seed-racer-speed" type="number" min="0" max="255" placeholder="km" aria-label="First chocobo top speed" /><span class="speed-unit">km</span></span></label>
+            <label class="stat-line"><span>Stamina</span><span class="select-wrap"><input id="pc-seed-racer-stamina" type="number" min="0" max="999" placeholder="—" aria-label="First chocobo stamina" /></span></label>
+            <label class="stat-line name-line"><span>Name</span><span class="select-wrap"><input id="pc-seed-racer-name" type="text" maxlength="8" placeholder="Name" aria-label="First chocobo name" /></span></label>
+          </section>
+
+          <section class="gift-board pc-gift-board" aria-label="Observed prizes to verify the seed">
+            <h2 class="gift-tab">GIFT</h2>
+            <div class="gift-fields">
+              <label class="gift-field"><img src="assets/class-b/item-icons/one.png" alt="" /><span class="sr-only">Observed gift one</span><span class="select-wrap"><select data-observed-gift="1"><option value="">Any gift</option></select><span class="select-arrow">⌄</span></span><span class="gift-gp" data-predicted-gift="1"></span></label>
+              <label class="gift-field"><img src="assets/class-b/item-icons/two.png" alt="" /><span class="sr-only">Observed gift two</span><span class="select-wrap"><select data-observed-gift="2"><option value="">Any gift</option></select><span class="select-arrow">⌄</span></span><span class="gift-gp" data-predicted-gift="2"></span></label>
+              <label class="gift-field"><img src="assets/class-b/item-icons/three.png" alt="" /><span class="sr-only">Observed gift three</span><span class="select-wrap"><select data-observed-gift="3"><option value="">Any gift</option></select><span class="select-arrow">⌄</span></span><span class="gift-gp" data-predicted-gift="3"></span></label>
+            </div>
+            <div id="pc-predict-prizes" class="sr-only" aria-label="Predicted gifts"></div>
+          </section>
+
+          <section class="field-window" aria-label="Predicted race field">
+            <div class="result-banner" id="pc-result-banner" aria-live="polite">
+              <span class="banner-mark" id="pc-banner-mark">↳</span>
+              <div><strong id="pc-seed-search-status">Ready when you are</strong><span id="pc-seed-search-detail">Enter chocobo #1 and search backward from the live PC clock.</span></div>
+              <button id="pc-seed-search-cancel" class="keep-searching-button" type="button" hidden>STOP</button>
+            </div>
+            <div class="race-list" id="pc-race-list" aria-live="polite">
+              <div class="empty-state"><strong>Six in the field</strong><span>Names · speed · stamina · jockey color</span></div>
+            </div>
+            <div class="time-fields pc-live-search-controls">
+              <span class="time-caption">LIVE PC TIME</span>
+              <label class="pc-lookback-label"><input id="pc-seed-lookback" type="number" min="1" max="1" value="1" aria-label="Search backward one hour" /><span>H</span></label>
+              <span class="pc-live-clock" id="pc-live-clock"></span>
+              <button id="pc-seed-search" class="search-button" type="button" aria-label="Search for the seed from current PC time">▶</button>
+            </div>
+          </section>
+
+          <section class="frame-card pc-seed-card" aria-label="Found PC seed">
+            <span class="frame-label">FOUND PC SEED</span>
+            <span class="frame-value" id="pc-found-seed">—<small>UNIX</small></span>
+            <span class="frame-time" id="pc-found-seed-time">Current PC time <span>—</span></span>
+          </section>
+        </section>
+
+        <details id="pc-seed-search-list" class="seed-candidate-list" hidden>
+          <summary>Other seed matches</summary>
+          <div id="pc-seed-search-results" class="seed-results"></div>
+        </details>
+
+        <section class="panel calibration" aria-labelledby="calibration-title">
+          <h2 id="calibration-title">Calibrate the next race</h2>
+          <div class="calibration-seed-row">
+            <label>Starting race seed (local)<input id="pc-seed-time" type="datetime-local" step="1" /></label>
+            <button id="pc-predict-button" type="button">LOAD / GENERATE SEED FIELD</button>
+          </div>
+          <div class="gap-limit-row">
+            <label for="pc-gap-start">Starting RNG call<input id="pc-gap-start" type="number" min="0" max="1000000" step="1" value="0" /></label>
+            <label for="pc-gap-limit">Maximum RNG call<input id="pc-gap-limit" type="number" min="0" max="1000000" step="1000" value="100000" /></label>
+          </div>
+          <p class="help-text">The gap is measured in RNG calls, not seconds. Gifts auto-filled from the first race are not used to filter this search.</p>
+          <div class="observed-race-table" role="group" aria-label="Observed next race first chocobo">
+            <div class="observed-race-heading"><span>Chocobo</span><span>Name</span><span>Top speed</span><span>Stamina</span></div>
+            <div class="observed-race-row"><strong>#1</strong><input data-racer="1" data-key="name" aria-label="Next race chocobo 1 name" value="T" placeholder="Name" /><input data-racer="1" data-key="speed" aria-label="Next race chocobo 1 top speed" type="number" value="83" placeholder="km" /><input data-racer="1" data-key="stamina" aria-label="Next race chocobo 1 stamina" type="number" value="265" placeholder="Stamina" /></div>
+          </div>
+          <div class="calibration-actions"><button id="pc-gap-search" type="button">FIND RNG CALL GAP</button><button id="pc-gap-cancel" type="button" hidden>STOP SEARCH</button></div>
+          <div id="pc-gap-status" class="status" aria-live="polite">Find a first-race seed above before searching.</div>
+          <div id="pc-gap-result" class="gap-result" hidden>
+            <h3>Next race match</h3>
+            <div id="pc-gap-result-details" class="status"></div>
+            <label class="candidate-picker" for="pc-gap-candidate" hidden>Candidate gap<select id="pc-gap-candidate"></select></label>
+            <ol id="pc-gap-field" class="gap-field pc-racer-strip"></ol>
+            <div id="pc-gap-prizes" class="prize-list"></div>
+            <button id="pc-gap-populate" type="button">POPULATE ABOVE</button>
+          </div>
+        </section>
+
+        <section class="panel future-prize" aria-labelledby="future-prize-title">
+          <h2 id="future-prize-title">Future prize times</h2>
+          <p>Search upcoming PC clock-seed seconds for a field where your target prize is on at least one green suggested bet.</p>
+          <p class="calibration-note">This predicts opening fields and prize draws. Green bets use the speed / jockey-rank heuristic; finish order is not simulated.</p>
+          <div class="future-prize-controls">
+            <label>Class<select id="pc-future-rank"><option>C</option><option>B</option><option>A</option><option>S</option></select></label>
+            <label>Target prize<select id="pc-future-prize"></select></label>
+            <label>Look ahead (hours)<input id="pc-future-hours" type="number" min="1" max="168" value="24" /></label>
+            <label>Times to find<input id="pc-future-count" type="number" min="1" max="50" value="10" /></label>
+          </div>
+          <div class="calibration-actions"><button id="pc-future-search" type="button">FIND FUTURE TIMES</button><button id="pc-future-cancel" type="button" hidden>STOP SEARCH</button></div>
+          <div id="pc-future-status" class="status" aria-live="polite">Choose a prize and search upcoming seed seconds.</div>
+          <div id="pc-future-results" class="future-results"></div>
+        </section>
+      </main>
+    </div>
+    <script src="pc-race-model.js"></script>
+    <script src="pc-predictor-ui.js"></script>
+  </body>
+</html>

@@ -4,3 +4,6 @@ Random scripts used in analyzing the chocobo betting in ff7 from 1997
 
 - [Basic overview](https://www.youtube.com/watch?v=jXLHLeT12Ts)
 - [Dive on in](https://forums.qhimm.com/index.php?topic=21011)
+
+## PC Chocobo Race Predictor
+[PC seed, field, and prize predictor](pc/)

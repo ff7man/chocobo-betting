@@ -1,0 +1,61 @@
+{
+  "seedSeconds": 1672597506,
+  "rank": "C",
+  "raceLength": "short",
+  "races": [
+    {
+      "number": 1,
+      "gifts": ["Hi-Potion", "Turbo Ether", "Megalixir"],
+      "entrants": [
+        { "name": "TERRY", "topSpeed": 85, "stamina": 273 },
+        { "name": "T", "topSpeed": 78, "stamina": 263 },
+        { "name": "TIM", "topSpeed": 76, "stamina": 264 },
+        { "name": "JOHN", "topSpeed": 74, "stamina": 276 },
+        { "name": "JU", "topSpeed": 84, "stamina": 272 },
+        { "name": "GEORGE", "topSpeed": 82, "stamina": 256 }
+      ]
+    },
+    {
+      "number": 2,
+      "gifts": ["Tranquilizer", "Hyper", "Phoenix Down"],
+      "entrants": [
+        { "name": "T", "topSpeed": 80, "stamina": 275 },
+        { "name": "LE", "topSpeed": 80, "stamina": 276 },
+        { "name": "ROBER", "topSpeed": 79, "stamina": 259 },
+        { "name": "TOM", "topSpeed": 74, "stamina": 267 },
+        { "name": "K", "topSpeed": 79, "stamina": 252 },
+        { "name": "GARY", "topSpeed": 76, "stamina": 253 }
+      ]
+    }
+  ],
+  "additionalRace2Observations": [
+    {
+      "run": 2,
+      "gifts": ["Tranquilizer", "Turbo Ether", "Ice Crystal"],
+      "entrants": [
+        { "name": "FOX", "topSpeed": 81, "stamina": 268 },
+        { "name": "LIA", "topSpeed": 83, "stamina": 250 },
+        { "name": "PAU", "topSpeed": 88, "stamina": 261 },
+        { "name": "SEAN", "topSpeed": 79, "stamina": 279 },
+        { "name": "GEORGE", "topSpeed": 82, "stamina": 255 },
+        { "name": "JU", "topSpeed": 75, "stamina": 277 }
+      ],
+      "seedConfirmed": true,
+      "candidateInterveningCallsFromRace1FieldAtSeed1672597506": 18017
+    },
+    {
+      "run": 3,
+      "gifts": ["Hyper", "Tranquilizer", "Hi-Potion"],
+      "entrants": [
+        { "name": "T", "topSpeed": 83, "stamina": 265 },
+        { "name": "PETER", "topSpeed": 74, "stamina": 274 },
+        { "name": "ROBER", "topSpeed": 76, "stamina": 276 },
+        { "name": "JAMES", "topSpeed": 80, "stamina": 272 },
+        { "name": "HARVEY", "topSpeed": 81, "stamina": 261 },
+        { "name": "EDWARD", "topSpeed": 82, "stamina": 277 }
+      ],
+      "seedConfirmed": true,
+      "candidateInterveningCallsFromRace1FieldAtSeed1672597506": 17964
+    }
+  ]
+}
