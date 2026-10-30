@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101512" />
+    <title>Chocobo Race Finder</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <main id="top">
+        <form id="search-form" class="game-screen">
+          <header class="game-title">
+            <span>Chocobo RACE Tool</span>
+            <label class="class-title">Class <span class="class-select-wrap"><select id="rank" name="rank" aria-label="Race class"><option value="C">C</option><option value="B" selected>B</option><option value="A">A</option><option value="S">S</option></select><span aria-hidden="true">⌄</span></span></label>
+          </header>
+
+          <section class="bet-board" aria-label="All fifteen chocobo pair tiles">
+            <div id="bet-grid" class="bet-grid"></div>
+          </section>
+
+          <section class="stats-board" aria-label="First chocobo details">
+            <label class="stat-line speed-line"><span>Top Speed</span><span class="speed-control"><span class="select-wrap"><select id="speed" name="speed" aria-label="Top speed"></select><span class="speed-unit" aria-hidden="true">km</span><span class="select-arrow">⌄</span></span></span></label>
+            <label class="stat-line"><span>Stamina</span><span class="select-wrap"><select id="stamina" name="stamina" aria-label="Stamina"></select><span class="select-arrow">⌄</span></span></label>
+            <label class="stat-line name-line"><span>Name</span><span class="select-wrap"><select id="name" name="name" aria-label="First chocobo name"></select><span class="select-arrow">⌄</span></span></label>
+          </section>
+
+          <section class="gift-board" aria-label="Race prizes">
+            <h2 class="gift-tab">GIFT</h2>
+            <div class="gift-fields">
+              <label class="gift-field"><img src="assets/class-b/item-icons/one.png" alt="" /><span class="sr-only">Prize one</span><span class="select-wrap"><select id="prize-0"></select><span class="select-arrow">⌄</span></span><span class="gift-gp" aria-live="polite"></span></label>
+              <label class="gift-field"><img src="assets/class-b/item-icons/two.png" alt="" /><span class="sr-only">Prize two</span><span class="select-wrap"><select id="prize-1"></select><span class="select-arrow">⌄</span></span><span class="gift-gp" aria-live="polite"></span></label>
+              <label class="gift-field"><img src="assets/class-b/item-icons/three.png" alt="" /><span class="sr-only">Prize three</span><span class="select-wrap"><select id="prize-2"></select><span class="select-arrow">⌄</span></span><span class="gift-gp" aria-live="polite"></span></label>
+            </div>
+          </section>
+
+          <section class="field-window" aria-label="Six generated chocobos">
+            <div class="result-banner" id="result-banner" aria-live="polite">
+              <span class="banner-mark" id="banner-mark">↳</span>
+              <div><strong id="result-status">Ready when you are</strong><span id="result-detail">Enter the race menu details to search.</span></div>
+              <button class="keep-searching-button" id="keep-searching-button" type="button" hidden>KEEP SEARCHING</button>
+            </div>
+            <div class="race-list" id="race-list" aria-live="polite">
+              <div class="empty-state"><strong>Six in the field</strong><span>Names · speed · stamina · AI</span></div>
+            </div>
+            <div class="time-fields">
+              <span class="time-caption">RESET</span>
+              <label><input id="hours" type="number" min="0" max="999999" value="0" inputmode="numeric" aria-label="Hours since power reset" /><span>H</span></label>
+              <i>:</i>
+              <label><input id="minutes" type="number" min="0" max="59" value="0" inputmode="numeric" aria-label="Minutes since power reset" /><span>M</span></label>
+              <i>:</i>
+              <label><input id="seconds" type="number" min="0" max="59" step="any" value="0" inputmode="numeric" aria-label="Seconds since power reset" /><span>S</span></label>
+              <button class="new-race-button" id="new-race-button" type="button" disabled>NEW RACE</button>
+              <button class="search-button" id="search-button" type="submit" aria-label="Find matching frame">▶</button>
+              <button class="cancel-button" id="cancel-button" type="button" hidden>STOP</button>
+            </div>
+          </section>
+
+          <section class="frame-card" id="frame-card" aria-label="Found frame">
+            <span class="frame-label">FOUND FRAME</span>
+            <span class="frame-value" id="frame-value">—<small>FRAME</small></span>
+            <span class="frame-time" id="frame-time">Time since reset <span>00:00:00</span></span>
+          </section>
+        </form>
+
+        <section class="prize-hunt" aria-labelledby="prize-hunt-title">
+          <h2 id="prize-hunt-title">Find Winnable Prize Frames</h2>
+          <p>Look ahead and predict when you should start the next race to get a chance at winning a desired prize</p>
+          <div class="prize-hunt-controls">
+            <label>Starting frame<input id="hunt-frame" type="number" min="0" max="4194303" step="1" value="0" /></label>
+            <label>Class<select id="hunt-rank"><option value="C">C</option><option value="B" selected>B</option><option value="A">A</option><option value="S">S</option></select></label>
+            <label>Target prize<select id="hunt-prize"></select></label>
+            <label>Time before next try<select id="hunt-step"><option value="30">30 seconds</option><option value="45">45 seconds</option><option value="60" selected>60 seconds</option><option value="90">90 seconds</option><option value="120">120 seconds</option></select></label>
+            <button id="hunt-button" type="button">Find next 10</button>
+          </div>
+          <div id="hunt-status" class="hunt-status" aria-live="polite">Choose a starting frame, class, and prize.</div>
+          <ol id="hunt-results" class="hunt-results" aria-live="polite"></ol>
+        </section>
+      </main>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

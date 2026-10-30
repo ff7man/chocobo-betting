@@ -7,3 +7,6 @@ Random scripts used in analyzing the chocobo betting in ff7 from 1997
 
 ## PC Chocobo Race Predictor
 [PC seed, field, and prize predictor](pc/)
+
+## PlayStation Chocobo Race Finder
+[PSX frame and prize search tool](psx/)
