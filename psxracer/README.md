@@ -2,7 +2,11 @@
 
 ![PSX Chocobo Racer screenshot](screenshot.png)
 
-PSX Chocobo Racer combines the PlayStation frame finder UI with a local DuckStation race runner. Enter the race details from the console; when the finder identifies a matching frame, the page sends that frame and class to DuckStation for a real race simulation.
+Estimations through math are good, but wouldn't it be nice if I could just spin up an emulator and run a specific race and know exactly who wins in seconds.
+
+That's this. 
+
+PSX Chocobo Racer combines the PlayStation frame finder UI with a local DuckStation race runner. Enter the race details from the console; when the finder identifies a matching frame, the page sends that frame and class to DuckStation for a real race simulation and reports back on who you should bet on.
 
 ## How it finds the true winners
 
