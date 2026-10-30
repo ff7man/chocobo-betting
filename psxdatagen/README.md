@@ -2,7 +2,7 @@
 
 ![PSX Chocobo Data Generator screenshot](screenshot.png)
 
-This tool runs four isolated custom DuckStation workers in parallel to farm PlayStation chocobo race data into CSV files. It can collect data much faster than the previous BizHawk + Lua workflow. The CSV format matches the historical `ml/race.lua` data and can be imported into **[PSX Computed](../psxcomputed/)** to expand its cached winner database. No generated race data, emulator build, BIOS, game image, or save states are included here.
+This tool runs four isolated custom DuckStation workers in parallel to farm PlayStation chocobo race data into CSV files. It can collect data much faster than the previous BizHawk + Lua workflow. The CSV format matches the historical `ml/race.lua` data and can be imported into **[PSX Computed](../psxcomputed/)** to expand its cached winner database. No generated race data, emulator build, BIOS, or game image is included here.
 
 ## What it generates
 
@@ -35,6 +35,8 @@ cmake --build build --target duckstation-qt -j4
 Install Xcode Command Line Tools and DuckStation's required build dependencies first. The scripts look for the built executable and resources in `duckstation/build/bin/`. They also accept `duckstation/bin/` if you provide a separate runtime there.
 
 ## Configure your game files
+
+The four class save states are available in [`SCUS-94165_saves.zip`](SCUS-94165_saves.zip). Extract the archive and place `SCUS-94165_2.sav` through `SCUS-94165_5.sav` in your DuckStation `savestates` folder. Slots 2, 3, 4, and 5 are used for classes C, B, A, and S respectively.
 
 The runner expects your local DuckStation data in the standard macOS locations:
 
