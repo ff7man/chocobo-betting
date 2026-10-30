@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101512" />
+    <title>Chocobo RACE Manual</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body data-rank="C">
+    <main class="game-screen" id="top">
+      <header class="game-title">
+        <span>Chocobo RACE Tool <small>MANUAL</small></span>
+        <label class="class-title">CLASS
+          <span class="class-select-wrap">
+            <select id="class-select" aria-label="Race class">
+              <option value="C" selected>C</option><option value="B">B</option><option value="A">A</option><option value="S">S</option>
+            </select><span aria-hidden="true"></span>
+          </span>
+        </label>
+      </header>
+
+      <section class="bet-board" aria-label="Betting pair grid">
+        <div id="bet-grid" class="bet-grid"></div>
+      </section>
+
+      <section class="bet-guide" aria-live="polite">
+        <h2>BETTING GUIDE</h2>
+        <div class="guide-line"><span class="guide-square guide-square--green"></span><span><b>Green</b> · Suggested pair</span></div>
+        <div class="guide-line"><span class="guide-square guide-square--red"></span><span><b>Red</b> · Includes a Bronze jockey</span></div>
+        <p>Suggestions rank speed and jockey color. Bronze racers are excluded. Click racer fields to edit; click color or sprint to change them.</p>
+        <div class="suggestion-line"><span>Suggested pairs</span><strong id="suggested-pairs">—</strong></div>
+      </section>
+
+      <section class="field-window" aria-label="Manual racer details">
+        <div class="result-banner"><span class="banner-mark">✎</span><div><strong>Manual race entry</strong><span id="entry-status">Edit any racer; betting indicators update as you type.</span></div></div>
+        <div class="race-list" id="race-list"></div>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
