@@ -1,0 +1,326 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "capturesettingswidget.h"
+#include "qtutils.h"
+#include "settingswindow.h"
+#include "settingwidgetbinder.h"
+
+#include "util/media_capture.h"
+
+#include "common/error.h"
+
+#include "moc_capturesettingswidget.cpp"
+
+CaptureSettingsWidget::CaptureSettingsWidget(SettingsWindow* dialog, QWidget* parent)
+  : QWidget(parent), m_dialog(dialog)
+{
+  SettingsInterface* sif = dialog->getSettingsInterface();
+
+  m_ui.setupUi(this);
+  QtUtils::FixSpinBoxTextMargins(this);
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.screenshotSize, Settings::DISPLAY_SECTION_NAME, "ScreenshotMode", &Settings::ParseDisplayScreenshotMode,
+    &Settings::GetDisplayScreenshotModeName, &Settings::GetDisplayScreenshotModeDisplayName,
+    Settings::DEFAULT_DISPLAY_SCREENSHOT_MODE, DisplayScreenshotMode::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.screenshotFormat, Settings::DISPLAY_SECTION_NAME, "ScreenshotFormat",
+    &Settings::ParseDisplayScreenshotFormat, &Settings::GetDisplayScreenshotFormatName,
+    &Settings::GetDisplayScreenshotFormatDisplayName, Settings::DEFAULT_DISPLAY_SCREENSHOT_FORMAT,
+    DisplayScreenshotFormat::Count);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.screenshotQuality, Settings::DISPLAY_SECTION_NAME,
+                                              "ScreenshotQuality", Settings::DEFAULT_DISPLAY_SCREENSHOT_QUALITY);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.screenshotSaveName, Settings::DISPLAY_SECTION_NAME, "ScreenshotFileNameFormat",
+    &Settings::ParseCaptureFileNameFormat, &Settings::GetCaptureFileNameFormatName,
+    &Settings::GetCaptureFileNameFormatDisplayName, Settings::DEFAULT_DISPLAY_SCREENSHOT_FILENAME_FORMAT,
+    CaptureFileNameFormat::Count);
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.mediaCaptureBackend, MediaCapture::CONFIG_SECTION_NAME,
+                                               "Backend", &MediaCapture::ParseBackendName,
+                                               &MediaCapture::GetBackendName, &MediaCapture::GetBackendDisplayName,
+                                               Settings::DEFAULT_MEDIA_CAPTURE_BACKEND, MediaCaptureBackend::MaxCount);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.mediaCaptureSaveName, MediaCapture::CONFIG_SECTION_NAME, "FilenameFormat",
+    &Settings::ParseCaptureFileNameFormat, &Settings::GetCaptureFileNameFormatName,
+    &Settings::GetCaptureFileNameFormatDisplayName, Settings::DEFAULT_MEDIA_CAPTURE_FILENAME_FORMAT,
+    CaptureFileNameFormat::Count);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.videoCaptureWidth, MediaCapture::CONFIG_SECTION_NAME,
+                                              "VideoWidth", Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_WIDTH);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.videoCaptureHeight, MediaCapture::CONFIG_SECTION_NAME,
+                                              "VideoHeight", Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_HEIGHT);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.videoCaptureResolutionAuto, MediaCapture::CONFIG_SECTION_NAME,
+                                               "VideoAutoSize", false);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.videoCaptureBitrate, MediaCapture::CONFIG_SECTION_NAME,
+                                              "VideoBitrate", Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_BITRATE);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableVideoCaptureArguments, MediaCapture::CONFIG_SECTION_NAME,
+                                               "VideoCodecUseArgs", false);
+  SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.videoCaptureArguments, MediaCapture::CONFIG_SECTION_NAME,
+                                                 "VideoCodecArgs");
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.audioCaptureBitrate, MediaCapture::CONFIG_SECTION_NAME,
+                                              "AudioBitrate", Settings::DEFAULT_MEDIA_CAPTURE_AUDIO_BITRATE);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableAudioCaptureArguments, MediaCapture::CONFIG_SECTION_NAME,
+                                               "AudioCodecUseArgs", false);
+  SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.audioCaptureArguments, MediaCapture::CONFIG_SECTION_NAME,
+                                                 "AudioCodecArgs");
+
+  if (!m_dialog->isPerGameSettings())
+  {
+    SettingWidgetBinder::BindWidgetToFolderSetting(sif, m_ui.screenshotsDirectory, m_ui.screenshotsDirectoryBrowse,
+                                                   tr("Select Screenshots Directory"), m_ui.screenshotsDirectoryOpen,
+                                                   m_ui.screenshotsDirectoryReset, Settings::FOLDERS_SECTION_NAME,
+                                                   "Screenshots", Path::Combine(EmuFolders::DataRoot, "screenshots"));
+    SettingWidgetBinder::BindWidgetToFolderSetting(sif, m_ui.videosDirectory, m_ui.videosDirectoryBrowse,
+                                                   tr("Select Media Capture Directory"), m_ui.videosDirectoryOpen,
+                                                   m_ui.videosDirectoryReset, Settings::FOLDERS_SECTION_NAME, "Videos",
+                                                   Path::Combine(EmuFolders::DataRoot, "videos"));
+  }
+  else
+  {
+    m_ui.screenshotsLayout->removeWidget(m_ui.screenshotsDirectoryLabel);
+    m_ui.screenshotsDirectoryLayout->removeWidget(m_ui.screenshotsDirectory);
+    m_ui.screenshotsDirectoryLayout->removeWidget(m_ui.screenshotsDirectoryBrowse);
+    m_ui.screenshotsDirectoryLayout->removeWidget(m_ui.screenshotsDirectoryOpen);
+    m_ui.screenshotsDirectoryLayout->removeWidget(m_ui.screenshotsDirectoryReset);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectoryLabel);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectoryLayout);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectory);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectoryBrowse);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectoryOpen);
+    QtUtils::SafeDeleteWidget(m_ui.screenshotsDirectoryReset);
+
+    m_ui.captureLayout->removeWidget(m_ui.videosDirectoryLabel);
+    m_ui.videosDirectoryLayout->removeWidget(m_ui.videosDirectory);
+    m_ui.videosDirectoryLayout->removeWidget(m_ui.videosDirectoryBrowse);
+    m_ui.videosDirectoryLayout->removeWidget(m_ui.videosDirectoryOpen);
+    m_ui.videosDirectoryLayout->removeWidget(m_ui.videosDirectoryReset);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectoryLabel);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectoryLayout);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectory);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectoryBrowse);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectoryOpen);
+    QtUtils::SafeDeleteWidget(m_ui.videosDirectoryReset);
+  }
+
+  connect(m_ui.mediaCaptureBackend, &QComboBox::currentIndexChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureBackendChanged);
+  connect(m_ui.videoCaptureContainer, &QComboBox::currentIndexChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureVideoContainerChanged);
+  connect(m_ui.videoCaptureResolutionAuto, &QCheckBox::checkStateChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureVideoAutoResolutionChanged);
+  connect(m_ui.enableVideoCaptureArguments, &QCheckBox::checkStateChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureUseVideoArgsChanged);
+  connect(m_ui.audioCaptureContainer, &QComboBox::currentIndexChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureAudioContainerChanged);
+  connect(m_ui.enableAudioCaptureArguments, &QCheckBox::checkStateChanged, this,
+          &CaptureSettingsWidget::onMediaCaptureUseAudioArgsChanged);
+
+  // Init all dependent options.
+  onMediaCaptureBackendChanged();
+  onMediaCaptureVideoAutoResolutionChanged();
+  onMediaCaptureUseVideoArgsChanged();
+  onMediaCaptureUseAudioArgsChanged();
+
+  dialog->registerWidgetHelp(m_ui.screenshotSize, tr("Screenshot Size"), tr("Screen Resolution"),
+                             tr("Determines the resolution at which screenshots will be saved. Internal resolutions "
+                                "preserve more detail at the cost of file size."));
+  dialog->registerWidgetHelp(m_ui.screenshotsDirectory, tr("Save Location"), tr("Default"),
+                             tr("Specifies the directory where screenshots will be saved."));
+  dialog->registerWidgetHelp(
+    m_ui.screenshotSaveName, tr("Save Name"),
+    Settings::GetCaptureFileNameFormatDisplayName(Settings::DEFAULT_DISPLAY_SCREENSHOT_FILENAME_FORMAT),
+    tr("Determines the format of the filename used when saving screenshots, and whether a subdirectory is created "
+       "per-game."));
+  dialog->registerWidgetHelp(
+    m_ui.screenshotFormat, tr("Screenshot Format"),
+    Settings::GetDisplayScreenshotFormatDisplayName(Settings::DEFAULT_DISPLAY_SCREENSHOT_FORMAT),
+    tr("Selects the format which will be used to save screenshots. JPEG produces smaller files, but loses detail."));
+  dialog->registerWidgetHelp(m_ui.screenshotQuality, tr("Screenshot Quality"),
+                             QStringLiteral("%1%").arg(Settings::DEFAULT_DISPLAY_SCREENSHOT_QUALITY),
+                             tr("Selects the quality at which screenshots will be compressed. Higher values preserve "
+                                "more detail for JPEG, and reduce file size for PNG."));
+  dialog->registerWidgetHelp(
+    m_ui.mediaCaptureBackend, tr("Backend"),
+    QString::fromUtf8(MediaCapture::GetBackendDisplayName(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND)),
+    tr("Selects the framework that is used to encode video/audio."));
+  dialog->registerWidgetHelp(m_ui.videosDirectory, tr("Save Location"), tr("Default"),
+                             tr("Specifies the directory where media capture (video/audio) will be saved."));
+  dialog->registerWidgetHelp(
+    m_ui.mediaCaptureSaveName, tr("Save Name"),
+    Settings::GetCaptureFileNameFormatDisplayName(Settings::DEFAULT_MEDIA_CAPTURE_FILENAME_FORMAT),
+    tr("Determines the format of the filename used when saving screenshots, and whether a subdirectory is created "
+       "per-game."));
+  dialog->registerWidgetHelp(m_ui.videoCaptureContainer, tr("Container"),
+                             Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_CONTAINER,
+                             tr("Determines the file format used to contain the captured video."));
+  dialog->registerWidgetHelp(
+    m_ui.videoCaptureCodec, tr("Video Codec"), tr("Default"),
+    tr("Selects which Video Codec to be used for media capture. <b>If unsure, leave it on default.</b>"));
+  dialog->registerWidgetHelp(m_ui.videoCaptureBitrate, tr("Video Bitrate"),
+                             tr("%1 kbps").arg(Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_BITRATE),
+                             tr("Sets the video bitrate to be used. Larger bitrate generally yields better video "
+                                "quality at the cost of larger resulting file size."));
+  dialog->registerWidgetHelp(
+    m_ui.videoCaptureResolutionAuto, tr("Automatic Resolution"), tr("Unchecked"),
+    tr("When checked, the video capture resolution will follows the internal resolution of the running "
+       "game. <b>Be careful when using this setting especially when you are upscaling, as higher internal "
+       "resolutions (above 4x) can cause system slowdown.</b>"));
+  dialog->registerWidgetHelp(m_ui.enableVideoCaptureArguments, tr("Enable Extra Video Arguments"), tr("Unchecked"),
+                             tr("Allows you to pass arguments to the selected video codec."));
+  dialog->registerWidgetHelp(
+    m_ui.videoCaptureArguments, tr("Extra Video Arguments"), tr("Empty"),
+    tr("Parameters passed to the selected video codec.<br><b>You must use '=' to separate key from value and ':' to "
+       "separate two pairs from each other.</b><br>For example: \"crf = 21 : preset = veryfast\""));
+  dialog->registerWidgetHelp(m_ui.audioCaptureContainer, tr("Container"),
+                             Settings::DEFAULT_MEDIA_CAPTURE_AUDIO_CONTAINER,
+                             tr("Determines the file format used to contain the captured audio."));
+  dialog->registerWidgetHelp(
+    m_ui.audioCaptureCodec, tr("Audio Codec"), tr("Default"),
+    tr("Selects which Audio Codec to be used for media capture. <b>If unsure, leave it on default.</b>"));
+  dialog->registerWidgetHelp(m_ui.audioCaptureBitrate, tr("Audio Bitrate"),
+                             tr("%1 kbps").arg(Settings::DEFAULT_MEDIA_CAPTURE_AUDIO_BITRATE),
+                             tr("Sets the audio bitrate to be used."));
+  dialog->registerWidgetHelp(m_ui.enableAudioCaptureArguments, tr("Enable Extra Audio Arguments"), tr("Unchecked"),
+                             tr("Allows you to pass arguments to the selected audio codec."));
+  dialog->registerWidgetHelp(
+    m_ui.audioCaptureArguments, tr("Extra Audio Arguments"), tr("Empty"),
+    tr("Parameters passed to the selected audio codec.<br><b>You must use '=' to separate key from value and ':' to "
+       "separate two pairs from each other.</b><br>For example: \"compression_level = 4 : joint_stereo = 1\""));
+}
+
+CaptureSettingsWidget::~CaptureSettingsWidget() = default;
+
+void CaptureSettingsWidget::onMediaCaptureBackendChanged()
+{
+  SettingsInterface* const sif = m_dialog->getSettingsInterface();
+  const MediaCaptureBackend backend =
+    MediaCapture::ParseBackendName(
+      m_dialog
+        ->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "Backend",
+                                  MediaCapture::GetBackendName(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND))
+        .c_str())
+      .value_or(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND);
+
+  {
+    SettingWidgetBinder::DisconnectWidget(m_ui.audioCaptureContainer);
+    m_ui.audioCaptureContainer->clear();
+    SettingWidgetBinder::DisconnectWidget(m_ui.videoCaptureContainer);
+    m_ui.videoCaptureContainer->clear();
+
+    for (const auto& [name, display_name] : MediaCapture::GetAudioContainerList(backend))
+    {
+      const QString qname = QString::fromStdString(name);
+      m_ui.audioCaptureContainer->addItem(tr("%1 (%2)").arg(QString::fromStdString(display_name), qname), qname);
+    }
+
+    for (const auto& [name, display_name] : MediaCapture::GetVideoContainerList(backend))
+    {
+      const QString qname = QString::fromStdString(name);
+      m_ui.videoCaptureContainer->addItem(tr("%1 (%2)").arg(QString::fromStdString(display_name), qname), qname);
+    }
+
+    SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.audioCaptureContainer, MediaCapture::CONFIG_SECTION_NAME,
+                                                   "AudioContainer", Settings::DEFAULT_MEDIA_CAPTURE_AUDIO_CONTAINER);
+    connect(m_ui.audioCaptureContainer, &QComboBox::currentIndexChanged, this,
+            &CaptureSettingsWidget::onMediaCaptureAudioContainerChanged);
+
+    SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.videoCaptureContainer, MediaCapture::CONFIG_SECTION_NAME,
+                                                   "VideoContainer", Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_CONTAINER);
+    connect(m_ui.videoCaptureContainer, &QComboBox::currentIndexChanged, this,
+            &CaptureSettingsWidget::onMediaCaptureVideoContainerChanged);
+  }
+
+  onMediaCaptureAudioContainerChanged();
+  onMediaCaptureVideoContainerChanged();
+}
+
+void CaptureSettingsWidget::onMediaCaptureVideoContainerChanged()
+{
+  SettingsInterface* const sif = m_dialog->getSettingsInterface();
+  const MediaCaptureBackend backend =
+    MediaCapture::ParseBackendName(
+      m_dialog
+        ->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "Backend",
+                                  MediaCapture::GetBackendName(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND))
+        .c_str())
+      .value_or(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND);
+  const std::string container = m_dialog->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "VideoContainer",
+                                                                  Settings::DEFAULT_MEDIA_CAPTURE_VIDEO_CONTAINER);
+
+  SettingWidgetBinder::DisconnectWidget(m_ui.videoCaptureCodec);
+  m_ui.videoCaptureCodec->clear();
+  m_ui.videoCaptureCodec->addItem(tr("Default"), QVariant(QString()));
+
+  for (const auto& [name, display_name] : MediaCapture::GetVideoCodecList(backend, container.c_str()))
+  {
+    const QString qname = QString::fromStdString(name);
+    m_ui.videoCaptureCodec->addItem(tr("%1 (%2)").arg(QString::fromStdString(display_name), qname), qname);
+  }
+
+  if (const QString current_value =
+        QString::fromStdString(m_dialog->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "VideoCodec", ""));
+      !current_value.isEmpty() && m_ui.videoCaptureCodec->findData(current_value) < 0)
+  {
+    m_ui.videoCaptureCodec->addItem(tr("%1 (Unknown)").arg(current_value), current_value);
+  }
+
+  SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.videoCaptureCodec, MediaCapture::CONFIG_SECTION_NAME,
+                                                 "VideoCodec");
+}
+
+void CaptureSettingsWidget::onMediaCaptureVideoAutoResolutionChanged()
+{
+  const bool auto_enabled = m_dialog->getEffectiveBoolValue(MediaCapture::CONFIG_SECTION_NAME, "VideoAutoSize", false);
+  m_ui.videoCaptureWidth->setEnabled(!auto_enabled);
+  m_ui.xLabel->setEnabled(!auto_enabled);
+  m_ui.videoCaptureHeight->setEnabled(!auto_enabled);
+}
+
+void CaptureSettingsWidget::onMediaCaptureUseVideoArgsChanged()
+{
+  const bool extra_video_args_enabled =
+    m_dialog->getEffectiveBoolValue(MediaCapture::CONFIG_SECTION_NAME, "VideoCodecUseArgs", false);
+  m_ui.videoCaptureArguments->setEnabled(extra_video_args_enabled);
+}
+
+void CaptureSettingsWidget::onMediaCaptureAudioContainerChanged()
+{
+  SettingsInterface* const sif = m_dialog->getSettingsInterface();
+  const MediaCaptureBackend backend =
+    MediaCapture::ParseBackendName(
+      m_dialog
+        ->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "Backend",
+                                  MediaCapture::GetBackendName(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND))
+        .c_str())
+      .value_or(Settings::DEFAULT_MEDIA_CAPTURE_BACKEND);
+  const std::string container = m_dialog->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "AudioContainer",
+                                                                  Settings::DEFAULT_MEDIA_CAPTURE_AUDIO_CONTAINER);
+
+  SettingWidgetBinder::DisconnectWidget(m_ui.audioCaptureCodec);
+  m_ui.audioCaptureCodec->clear();
+  m_ui.audioCaptureCodec->addItem(tr("Default"), QVariant(QString()));
+
+  for (const auto& [name, display_name] : MediaCapture::GetAudioCodecList(backend, container.c_str()))
+  {
+    const QString qname = QString::fromStdString(name);
+    m_ui.audioCaptureCodec->addItem(tr("%1 (%2)").arg(QString::fromStdString(display_name), qname), qname);
+  }
+
+  if (const QString current_value =
+        QString::fromStdString(m_dialog->getEffectiveStringValue(MediaCapture::CONFIG_SECTION_NAME, "AudioCodec", ""));
+      !current_value.isEmpty() && m_ui.audioCaptureCodec->findData(current_value) < 0)
+  {
+    m_ui.audioCaptureCodec->addItem(tr("%1 (Unknown)").arg(current_value), current_value);
+  }
+
+  SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.audioCaptureCodec, MediaCapture::CONFIG_SECTION_NAME,
+                                                 "AudioCodec");
+}
+
+void CaptureSettingsWidget::onMediaCaptureUseAudioArgsChanged()
+{
+  const bool extra_audio_args_enabled =
+    m_dialog->getEffectiveBoolValue(MediaCapture::CONFIG_SECTION_NAME, "AudioCodecUseArgs", false);
+  m_ui.audioCaptureArguments->setEnabled(extra_audio_args_enabled);
+}

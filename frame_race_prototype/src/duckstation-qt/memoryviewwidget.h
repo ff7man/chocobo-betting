@@ -1,0 +1,96 @@
+#pragma once
+
+#include "common/types.h"
+
+#include <QtWidgets/QAbstractScrollArea>
+#include <functional>
+#include <vector>
+
+// Based on https://stackoverflow.com/questions/46375673/how-can-realize-my-own-memory-viewer-by-qt
+
+class MemoryViewWidget : public QAbstractScrollArea
+{
+  Q_OBJECT
+
+public:
+  static constexpr size_t INVALID_SELECTED_ADDRESS = ~static_cast<size_t>(0);
+
+  using EditCallback = void (*)(size_t offset, size_t bytes);
+
+  explicit MemoryViewWidget(QWidget* parent = nullptr, size_t address_offset = 0, void* data_ptr = nullptr,
+                            size_t data_size = 0, bool data_editable = false, EditCallback edit_callback = nullptr);
+  ~MemoryViewWidget();
+
+  ALWAYS_INLINE size_t dataSize() const { return m_data_size; }
+  ALWAYS_INLINE size_t addressOffset() const { return m_address_offset; }
+  ALWAYS_INLINE size_t startOffset() const { return m_start_offset; }
+  ALWAYS_INLINE size_t endOffset() const { return m_end_offset; }
+  ALWAYS_INLINE bool isDataEditable() const { return m_data_editable; }
+  size_t selectedAddress() const;
+  size_t topAddress() const;
+
+  void setData(size_t address_offset, void* data_ptr, size_t data_size, bool data_editable, EditCallback edit_callback);
+  void setHighlightRange(size_t start, size_t end);
+  void clearHighlightRange();
+  void scrollToOffset(size_t offset, bool select = true);
+  void scrollToAddress(size_t address);
+  void setFont(const QFont& font);
+
+  void saveCurrentData();
+  void forceRefresh();
+
+  /// Reads up to size bytes from the data at offset, returns the number of bytes read.
+  size_t readData(size_t offset, void* dst, size_t size) const;
+
+  /// Writes data on the core thread, then refreshes the view and calls on_complete on the UI thread.
+  bool writeData(size_t offset, const void* src, size_t size, std::function<void()> on_complete = {});
+
+Q_SIGNALS:
+  void topAddressChanged(size_t address);
+  void selectedAddressChanged(size_t address);
+
+protected:
+  void paintEvent(QPaintEvent* event) override;
+  void resizeEvent(QResizeEvent* event) override;
+  void mousePressEvent(QMouseEvent* event) override;
+  void mouseMoveEvent(QMouseEvent* event) override;
+  void keyPressEvent(QKeyEvent* event) override;
+
+private:
+  int addressWidth() const;
+  int hexWidth() const;
+  int asciiWidth() const;
+  void updateMetrics();
+  void updateSelectedByte(const QPoint& pos);
+  void setSelection(size_t new_selection, bool new_ascii);
+  void expandCurrentDataToInclude(size_t offset);
+  void adjustScrollToInclude(size_t offset);
+  void adjustContent();
+  void notifySelectedAddressChanged();
+
+  void* m_data = nullptr;
+  size_t m_data_size = 0;
+  size_t m_address_offset = 0;
+
+  size_t m_start_offset = 0;
+  size_t m_end_offset = 0;
+
+  size_t m_highlight_start = 0;
+  size_t m_highlight_end = 0;
+
+  size_t m_selected_address = INVALID_SELECTED_ADDRESS;
+  s32 m_editing_nibble = -1;
+  bool m_selection_was_ascii = false;
+  bool m_data_editable = false;
+
+  u32 m_bytes_per_line = 0;
+
+  int m_char_width = 0;
+  int m_char_height = 0;
+
+  int m_rows_visible = 0;
+
+  EditCallback m_edit_callback = nullptr;
+  std::vector<u8> m_last_data;
+  size_t m_last_data_start_offset = 0;
+};

@@ -1,0 +1,707 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "gamesummarywidget.h"
+#include "controllersettingswindow.h"
+#include "gamelistwidget.h"
+#include "mainwindow.h"
+#include "qthost.h"
+#include "qtprogresscallback.h"
+#include "qtutils.h"
+#include "settingswindow.h"
+
+#include "core/achievements.h"
+#include "core/controller.h"
+#include "core/core.h"
+#include "core/game_database.h"
+#include "core/game_list.h"
+
+#include "util/translation.h"
+
+#include "common/assert.h"
+#include "common/error.h"
+#include "common/string_util.h"
+#include "common/threading.h"
+
+#include "fmt/format.h"
+
+#include <QtCore/QDateTime>
+#include <QtCore/QSignalBlocker>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QDialogButtonBox>
+#include <QtWidgets/QTextEdit>
+
+#include "moc_gamesummarywidget.cpp"
+#include "ui_editgameserialdialog.h"
+
+using namespace Qt::StringLiterals;
+
+GameSummaryWidget::GameSummaryWidget(const GameList::Entry* entry, bool localized_titles, SettingsWindow* dialog,
+                                     QWidget* parent)
+  : m_dialog(dialog)
+{
+  m_ui.setupUi(this);
+
+  for (u32 i = 0; i < static_cast<u32>(GameList::EntryType::MaxCount); i++)
+  {
+    m_ui.entryType->addItem(QtUtils::GetIconForEntryType(static_cast<GameList::EntryType>(i)),
+                            QString::fromUtf8(GameList::GetEntryTypeDisplayName(static_cast<GameList::EntryType>(i))));
+  }
+
+  for (u32 i = 0; i < static_cast<u32>(DiscRegion::Count); i++)
+  {
+    m_ui.region->addItem(QtUtils::GetIconForRegion(static_cast<DiscRegion>(i)),
+                         QString::fromUtf8(Settings::GetDiscRegionDisplayName(static_cast<DiscRegion>(i))));
+  }
+
+  for (u32 i = 0; i < static_cast<u32>(GameDatabase::CompatibilityRating::Count); i++)
+  {
+    m_ui.compatibility->addItem(QtUtils::GetIconForCompatibility(static_cast<GameDatabase::CompatibilityRating>(i)),
+                                QString::fromUtf8(GameDatabase::GetCompatibilityRatingDisplayName(
+                                  static_cast<GameDatabase::CompatibilityRating>(i))));
+  }
+
+  // I hate this so much.
+  const std::string_view default_language =
+    entry->dbentry ? entry->dbentry->GetLanguageFlagName(entry->region) : Settings::GetDiscRegionName(entry->region);
+  m_ui.customLanguage->addItem(QtUtils::GetIconForLanguage(default_language), tr("Show Default Flag"));
+  for (u32 i = 0; i < static_cast<u32>(GameDatabase::Language::MaxCount); i++)
+  {
+    const char* language_name = GameDatabase::GetLanguageName(static_cast<GameDatabase::Language>(i));
+    m_ui.customLanguage->addItem(QtUtils::GetIconForLanguage(language_name), QString::fromUtf8(language_name));
+  }
+
+  populateUi(entry, localized_titles);
+
+  connect(m_ui.compatibilityComments, &QAbstractButton::clicked, this,
+          &GameSummaryWidget::onCompatibilityCommentsClicked);
+  connect(m_ui.inputProfile, &QComboBox::currentIndexChanged, this, &GameSummaryWidget::onInputProfileChanged);
+  connect(m_ui.editInputProfile, &QAbstractButton::clicked, this, &GameSummaryWidget::onEditInputProfileClicked);
+  connect(m_ui.computeHashes, &QAbstractButton::clicked, this, &GameSummaryWidget::onComputeHashClicked);
+
+  connect(m_ui.title, &QLineEdit::editingFinished, this, [this]() {
+    if (m_ui.title->isModified())
+    {
+      setCustomTitle(m_ui.title->text().toStdString());
+      m_ui.title->setModified(false);
+    }
+  });
+  connect(m_ui.restoreTitle, &QAbstractButton::clicked, this, [this]() { setCustomTitle({}); });
+  if (m_ui.discSetTitle)
+  {
+    connect(m_ui.discSetTitle, &QLineEdit::editingFinished, this, [this]() {
+      if (m_ui.discSetTitle->isModified())
+      {
+        setCustomDiscSetTitle(m_ui.discSetTitle->text().toStdString());
+        m_ui.discSetTitle->setModified(false);
+      }
+    });
+    connect(m_ui.restoreDiscSetTitle, &QAbstractButton::clicked, this, [this]() { setCustomDiscSetTitle({}); });
+  }
+  connect(m_ui.changeSerial, &QAbstractButton::clicked, this, &GameSummaryWidget::onChangeSerialClicked);
+  connect(m_ui.region, &QComboBox::currentIndexChanged, this, &GameSummaryWidget::setCustomRegion);
+  connect(m_ui.restoreRegion, &QAbstractButton::clicked, this, [this]() { setCustomRegion(-1); });
+  connect(m_ui.customLanguage, &QComboBox::currentIndexChanged, this, &GameSummaryWidget::onCustomLanguageChanged);
+}
+
+GameSummaryWidget::~GameSummaryWidget() = default;
+
+void GameSummaryWidget::reloadGameSettings()
+{
+  if (m_ui.separateDiscSettings->isVisible() && m_ui.separateDiscSettings->isEnabled())
+  {
+    m_ui.separateDiscSettings->setCheckState(
+      m_dialog->getBoolValue(Settings::INTERFACE_SECTION_NAME, "UseSeparateConfigForDiscSet", std::nullopt)
+          .value_or(false) ?
+        Qt::Checked :
+        Qt::Unchecked);
+  }
+
+  if (m_dialog->getBoolValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "UseGameSettingsForController", std::nullopt)
+        .value_or(false))
+  {
+    const QSignalBlocker sb(m_ui.inputProfile);
+    m_ui.inputProfile->setCurrentIndex(1);
+  }
+  else if (const std::optional<std::string> profile_name =
+             m_dialog->getStringValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "InputProfileName", std::nullopt);
+           profile_name.has_value() && !profile_name->empty())
+  {
+    const QSignalBlocker sb(m_ui.inputProfile);
+    m_ui.inputProfile->setCurrentIndex(m_ui.inputProfile->findText(QString::fromStdString(profile_name.value())));
+  }
+  else
+  {
+    const QSignalBlocker sb(m_ui.inputProfile);
+    m_ui.inputProfile->setCurrentIndex(0);
+  }
+  m_ui.editInputProfile->setEnabled(m_ui.inputProfile->currentIndex() >= 1);
+}
+
+void GameSummaryWidget::populateUi(const GameList::Entry* entry, bool localized_titles)
+{
+  m_path = entry->path;
+
+  m_ui.path->setText(QString::fromStdString(entry->path));
+  m_ui.serial->setText(entry->has_custom_serial ?
+                         tr("%1 (Custom)").arg(QtUtils::StringViewToQStringView(entry->serial)) :
+                         (entry->serial.empty() ? tr("Unknown") : QtUtils::StringViewToQString(entry->serial)));
+  if (entry->IsDiscOrDiscSet())
+  {
+    m_ui.hashes->setText(QtUtils::StringViewToQString(SmallString::from_format(
+      "HASH-{:016X} \u2022 RA: {}", entry->hash, Achievements::GameHashToString(entry->achievements_hash))));
+  }
+  else
+  {
+    m_ui.hashes->setText(tr("N/A"));
+  }
+  m_ui.title->setText(QtUtils::StringViewToQString(entry->GetDisplayTitle(localized_titles)));
+  m_ui.region->setCurrentIndex(static_cast<int>(entry->region));
+  m_ui.entryType->setCurrentIndex(static_cast<int>(entry->type));
+
+  m_ui.restoreTitle->setEnabled(entry->has_custom_title);
+  m_ui.restoreRegion->setEnabled(entry->has_custom_region);
+
+  // can't set languages on disc set entries
+  m_ui.customLanguage->setCurrentIndex(entry->HasCustomLanguage() ? (static_cast<u32>(entry->custom_language) + 1) : 0);
+  if (entry->IsDiscSet())
+    m_ui.customLanguage->setEnabled(false);
+
+  // Need to look up the entry for the disc set itself
+  Assert(!entry->disc_set_member || entry->GetDiscSetEntry());
+  const GameList::Entry* disc_set_entry =
+    entry->disc_set_member ? GameList::GetEntryForPath(entry->GetDiscSetEntry()->GetSaveTitle()) : nullptr;
+  if (disc_set_entry)
+  {
+    m_ui.discSetTitle->setText(QtUtils::StringViewToQString(disc_set_entry->GetDisplayTitle(localized_titles)));
+    m_ui.restoreDiscSetTitle->setEnabled(disc_set_entry->has_custom_title);
+  }
+  else
+  {
+    m_ui.mainLayout->removeWidget(m_ui.discSetTitleLabel);
+    QtUtils::SafeDeleteWidget(m_ui.discSetTitleLabel);
+    m_ui.mainLayout->removeWidget(m_ui.discSetTitle);
+    QtUtils::SafeDeleteWidget(m_ui.discSetTitle);
+    m_ui.mainLayout->removeWidget(m_ui.restoreDiscSetTitle);
+    QtUtils::SafeDeleteWidget(m_ui.restoreDiscSetTitle);
+  }
+
+  if (const GameDatabase::Entry* dbentry = entry->dbentry)
+  {
+    m_ui.compatibility->setCurrentIndex(static_cast<int>(dbentry->compatibility));
+
+    QString metadata;
+    if (!dbentry->genre.empty())
+      metadata = QtUtils::StringViewToQString(dbentry->genre);
+    if (!dbentry->developer.empty() && !dbentry->publisher.empty() && dbentry->developer != dbentry->publisher)
+    {
+      if (!metadata.isEmpty())
+        metadata.append(tr(" by "));
+      metadata.append(tr("%1 (published by %2)")
+                        .arg(QtUtils::StringViewToQStringView(dbentry->developer))
+                        .arg(QtUtils::StringViewToQStringView(dbentry->publisher)));
+    }
+    else if (!dbentry->developer.empty())
+    {
+      if (!metadata.isEmpty())
+        metadata.append(" by ");
+      metadata.append(QtUtils::StringViewToQStringView(dbentry->developer));
+    }
+    else if (!dbentry->publisher.empty())
+    {
+      if (!metadata.isEmpty())
+        metadata.append(", ");
+      metadata.append(tr("published by %1").arg(QtUtils::StringViewToQStringView(dbentry->publisher)));
+    }
+    if (!metadata.isEmpty())
+      m_ui.metadata->setText(metadata);
+    else
+      m_ui.metadata->setText(tr("Unknown"));
+
+    QString release_info;
+    if (dbentry->release_date != 0)
+    {
+      const QString date = QDateTime::fromSecsSinceEpoch(static_cast<qint64>(dbentry->release_date), QTimeZone::utc())
+                             .toString(QtHost::GetApplicationLocale().dateFormat(QLocale::ShortFormat));
+      release_info = tr("Released %1").arg(date);
+    }
+    if (dbentry->min_players != 0)
+    {
+      if (!release_info.isEmpty())
+        release_info.append(", ");
+      if (dbentry->min_players != dbentry->max_players)
+        release_info.append(tr("%1-%2 players").arg(dbentry->min_players).arg(dbentry->max_players));
+      else
+        release_info.append(tr("%n player(s)", nullptr, dbentry->min_players));
+    }
+    if (dbentry->min_blocks != 0)
+    {
+      if (!release_info.isEmpty())
+        release_info.append(", ");
+      if (dbentry->min_blocks != dbentry->max_blocks)
+        release_info.append(tr("%1-%2 memory card blocks").arg(dbentry->min_blocks).arg(dbentry->max_blocks));
+      else
+        release_info.append(tr("%n memory card block(s)", nullptr, dbentry->min_blocks));
+    }
+    if (!release_info.isEmpty())
+      m_ui.releaseInfo->setText(release_info);
+    else
+      m_ui.releaseInfo->setText(tr("Unknown"));
+
+    m_ui.languages->setText(QtUtils::StringViewToQString(dbentry->GetLanguagesString()));
+
+    QString controllers;
+    if (dbentry->supported_controllers != 0 && dbentry->supported_controllers != static_cast<u16>(-1))
+    {
+      for (u32 i = 0; i < static_cast<u32>(ControllerType::Count); i++)
+      {
+        if ((dbentry->supported_controllers & static_cast<u16>(1u << i)) != 0)
+        {
+          if (!controllers.isEmpty())
+            controllers.append(", ");
+          controllers.append(Controller::GetControllerInfo(static_cast<ControllerType>(i)).GetDisplayName());
+        }
+      }
+    }
+    if (controllers.isEmpty())
+      controllers = tr("Unknown");
+    m_ui.controllers->setText(controllers);
+
+    m_compatibility_comments = QString::fromStdString(dbentry->GenerateCompatibilityReport());
+  }
+  else
+  {
+    m_ui.metadata->setText(tr("Unknown"));
+    m_ui.releaseInfo->setText(tr("Unknown"));
+    m_ui.controllers->setText(tr("Unknown"));
+  }
+
+  if (entry->dbentry && entry->dbentry->disc_set)
+  {
+    if (entry->dbentry->IsFirstDiscInSet())
+    {
+      m_ui.separateDiscSettings->setCheckState(
+        m_dialog->getBoolValue(Settings::INTERFACE_SECTION_NAME, "UseSeparateConfigForDiscSet", std::nullopt)
+            .value_or(false) ?
+          Qt::Checked :
+          Qt::Unchecked);
+      connect(m_ui.separateDiscSettings, &QCheckBox::checkStateChanged, this,
+              &GameSummaryWidget::onSeparateDiscSettingsChanged);
+    }
+    else
+    {
+      // set disabled+checked if not first disc
+      m_ui.separateDiscSettings->setCheckState(Qt::Checked);
+      m_ui.separateDiscSettings->setEnabled(false);
+    }
+  }
+  else
+  {
+    m_ui.separateDiscSettings->setVisible(false);
+  }
+
+  m_ui.compatibilityComments->setEnabled(!m_compatibility_comments.isEmpty());
+
+  m_ui.inputProfile->addItem(QIcon(u":/icons/monochrome/svg/global-line.svg"_s), tr("Use Global Settings"));
+  m_ui.inputProfile->addItem(QIcon(u":/icons/monochrome/svg/controller-digital-line.svg"_s),
+                             tr("Game Specific Configuration"));
+  for (const std::string& name : InputManager::GetInputProfileNames())
+    m_ui.inputProfile->addItem(QString::fromStdString(name));
+
+  if (entry->achievements_game_id != 0)
+  {
+    m_ui.openRetroAchievementsGame->setIcon(QIcon(QtHost::GetResourceQPath(Achievements::RA_LOGO_SVG_ICON_NAME, true)));
+    m_ui.openRetroAchievementsGame->setText(tr("Game ID: %1").arg(entry->achievements_game_id));
+    m_ui.openRetroAchievementsGame->setEnabled(true);
+    connect(
+      m_ui.openRetroAchievementsGame, &QAbstractButton::clicked, this,
+      [this, game_id = entry->achievements_game_id]() { QtUtils::OpenURL(this, Achievements::GetGameURL(game_id)); });
+  }
+  else
+  {
+    m_ui.verifyLayout->removeWidget(m_ui.openRetroAchievementsGame);
+    QtUtils::SafeDeleteWidget(m_ui.openRetroAchievementsGame);
+  }
+
+  reloadGameSettings();
+
+  // Don't populate tracks when we're running from disc, because the core might have exclusive access.
+  if (!entry->is_runtime_populated || !CDImage::IsDeviceName(m_path.c_str()))
+    populateTracksInfo();
+
+  if (entry->is_runtime_populated)
+    disableWidgetsForRuntimeScannedEntry();
+}
+
+void GameSummaryWidget::onSeparateDiscSettingsChanged(Qt::CheckState state)
+{
+  if (state == Qt::Checked)
+    m_dialog->setBoolSettingValue(Settings::INTERFACE_SECTION_NAME, "UseSeparateConfigForDiscSet", true);
+  else
+    m_dialog->removeSettingValue(Settings::INTERFACE_SECTION_NAME, "UseSeparateConfigForDiscSet");
+
+  // Need to update for all discs when clearing separate-disc-settings.
+  if (state == Qt::Unchecked)
+  {
+    for (const std::string_view& serial : m_dialog->getDatabaseEntry()->disc_set->serials)
+    {
+      if (serial != m_dialog->getGameSerial())
+        System::ReloadSettingsForPath(System::GetGameSettingsPath(serial, true));
+    }
+  }
+}
+
+void GameSummaryWidget::onChangeSerialClicked()
+{
+  const auto lock = GameList::GetLock();
+  const GameList::Entry* entry = GameList::GetEntryForPath(m_path);
+  if (!entry)
+    return;
+
+  QDialog* const dialog = new QDialog(this);
+  Ui::EditGameSerialDialog dialog_ui;
+  dialog_ui.setupUi(dialog);
+  dialog_ui.icon->setPixmap(QIcon(u":/icons/monochrome/svg/disc-line.svg"_s).pixmap(32));
+  dialog_ui.path->setText(QString::fromStdString(m_path));
+  dialog_ui.serial->setText(QString::fromStdString(entry->serial));
+  dialog_ui.serial->setFocus();
+
+  if (entry->has_custom_serial)
+  {
+    QFont font(dialog_ui.serial->font());
+    font.setBold(true);
+    dialog_ui.serial->setFont(font);
+  }
+  else
+  {
+    dialog_ui.layout->removeWidget(dialog_ui.customState);
+    delete dialog_ui.customState;
+  }
+
+  connect(dialog_ui.serial, &QLineEdit::textChanged, dialog, [bbox = dialog_ui.buttonBox](const QString& text) {
+    const QString trimmed = text.trimmed();
+    bbox->button(QDialogButtonBox::Ok)->setEnabled(!trimmed.isEmpty());
+  });
+
+  connect(dialog_ui.buttonBox->button(QDialogButtonBox::Reset), &QPushButton::clicked, dialog,
+          [dialog, serial = dialog_ui.serial]() {
+            serial->setText(QString());
+            dialog->accept();
+          });
+
+  connect(dialog, &QDialog::accepted, dialog, [this, serial = dialog_ui.serial, path = m_path]() {
+    GameList::SaveCustomSerialForPath(m_path, serial->text().trimmed().toStdString());
+
+    // Changing the serial changes the gamesettings ini and basically everything else.
+    // Easiest way to deal with this is to just close the dialog and reopen it.
+    // Seems to get deleted later, thankfully.
+    m_dialog->close();
+
+    const auto lock = GameList::GetLock();
+    const GameList::Entry* entry = GameList::GetEntryForPath(m_path);
+    if (entry)
+      SettingsWindow::openGamePropertiesDialog(entry);
+  });
+
+  dialog->open();
+}
+
+void GameSummaryWidget::setCustomTitle(const std::string& text)
+{
+  GameList::SaveCustomTitleForPath(m_path, text);
+
+  {
+    const auto lock = GameList::GetLock();
+    const GameList::Entry* entry = GameList::GetEntryForPath(m_path);
+    if (entry)
+    {
+      const std::string_view title = entry->GetDisplayTitle(Core::GetBaseBoolSettingValue(
+        GameList::UI_SECTION_NAME, GameList::SETTING_KEY_LOCALIZED_TITLES, GameList::DEFAULT_LOCALIZED_TITLES));
+      m_dialog->setGameTitle(title);
+
+      {
+        const QSignalBlocker sb(m_ui.title);
+        m_ui.title->setText(QtUtils::StringViewToQString(title));
+      }
+
+      m_ui.restoreTitle->setEnabled(entry->has_custom_title);
+    }
+  }
+
+  g_main_window->getGameListWidget()->getModel()->invalidateColumnForPath(m_path, GameListModel::Column_Title);
+}
+
+void GameSummaryWidget::setCustomDiscSetTitle(const std::string& text)
+{
+  const auto lock = GameList::GetLock();
+  const GameList::Entry* entry = GameList::GetEntryForPath(m_path);
+  if (!entry->disc_set_member)
+    return;
+
+  const GameList::Entry* disc_set_entry =
+    entry->disc_set_member ? GameList::GetEntryForPath(entry->GetDiscSetEntry()->GetSaveTitle()) : nullptr;
+  if (!disc_set_entry)
+    return;
+
+  GameList::SaveCustomTitleForPath(disc_set_entry->path, text);
+
+  const QSignalBlocker sb(m_ui.discSetTitle);
+  m_ui.discSetTitle->setText(QtUtils::StringViewToQString(disc_set_entry->GetDisplayTitle(Core::GetBaseBoolSettingValue(
+    GameList::UI_SECTION_NAME, GameList::SETTING_KEY_LOCALIZED_TITLES, GameList::DEFAULT_LOCALIZED_TITLES))));
+
+  m_ui.restoreDiscSetTitle->setEnabled(disc_set_entry->has_custom_title);
+
+  g_main_window->getGameListWidget()->getModel()->invalidateColumnForPath(disc_set_entry->path,
+                                                                          GameListModel::Column_Title);
+}
+
+void GameSummaryWidget::setCustomRegion(int region)
+{
+  GameList::SaveCustomRegionForPath(m_path, (region >= 0) ? std::optional<DiscRegion>(static_cast<DiscRegion>(region)) :
+                                                            std::optional<DiscRegion>());
+
+  {
+    const auto lock = GameList::GetLock();
+    const GameList::Entry* entry = GameList::GetEntryForPath(m_path);
+    if (entry)
+    {
+      const QSignalBlocker sb(m_ui.region);
+      m_ui.region->setCurrentIndex(static_cast<int>(entry->region));
+      m_ui.restoreRegion->setEnabled(entry->has_custom_region);
+    }
+  }
+
+  g_main_window->getGameListWidget()->getModel()->invalidateColumnForPath(m_path, GameListModel::Column_Region);
+}
+
+void GameSummaryWidget::onCustomLanguageChanged(int language)
+{
+  GameList::SaveCustomLanguageForPath(
+    m_path, (language > 0) ? std::optional<GameDatabase::Language>(static_cast<GameDatabase::Language>(language - 1)) :
+                             std::optional<GameDatabase::Language>());
+
+  g_main_window->getGameListWidget()->getModel()->invalidateColumnForPath(m_path, GameListModel::Column_Region);
+}
+
+void GameSummaryWidget::populateTracksInfo()
+{
+  m_ui.tracks->clear();
+  QtUtils::SetColumnWidthsForTreeView(m_ui.tracks, {80, 90, 70, 70, -1, 40});
+
+  std::unique_ptr<CDImage> image = CDImage::Open(m_path.c_str(), false, nullptr);
+  if (!image)
+    return;
+
+  m_ui.tracksLabel->setText(QString::fromStdString(image->GetSummary()));
+
+  const u32 num_tracks = image->GetTrackCount();
+  for (u32 track = 1; track <= num_tracks; track++)
+  {
+    const CDImage::TrackMode mode = image->GetTrackMode(static_cast<u8>(track));
+
+    QTreeWidgetItem* row = new QTreeWidgetItem(m_ui.tracks);
+    row->setIcon(0, QIcon((mode == CDImage::TrackMode::Audio) ? u":/icons/monochrome/svg/file-music-line.svg"_s :
+                                                                u":/icons/monochrome/svg/disc-line.svg"_s));
+    row->setText(0, tr("Track %1").arg(track));
+    row->setText(1, QString::fromUtf8(CDImage::GetTrackModeDisplayName(mode)));
+    row->setText(2, QString::fromStdString(image->GetTrackStartMSFPosition(static_cast<u8>(track)).ToString()));
+    row->setText(3, QString::fromStdString(image->GetTrackMSFLength(static_cast<u8>(track)).ToString()));
+    row->setText(4, tr("<not computed>"));
+    row->setTextAlignment(5, Qt::AlignCenter);
+  }
+}
+
+void GameSummaryWidget::disableWidgetsForRuntimeScannedEntry()
+{
+  m_ui.title->setReadOnly(true);
+  m_ui.restoreTitle->setEnabled(false);
+  m_ui.region->setEnabled(false);
+  m_ui.restoreRegion->setEnabled(false);
+  m_ui.changeSerial->setEnabled(false);
+  m_ui.languages->setReadOnly(true);
+  m_ui.customLanguage->setEnabled(false);
+
+  // Need to re-add the spacer, ugh.
+  const int insert_row = m_ui.mainLayout->rowCount() - 1;
+  QLayoutItem* const spacer_item = m_ui.mainLayout->itemAtPosition(insert_row, 0);
+  if (spacer_item)
+    m_ui.mainLayout->removeItem(spacer_item);
+
+  QHBoxLayout* const warning_layout = new QHBoxLayout();
+  QLabel* const icon = new QLabel(this);
+  icon->setPixmap(QIcon(QtHost::GetResourceQPath("images/warning.svg", true)).pixmap(16, 16));
+  warning_layout->addWidget(icon);
+
+  QLabel* const warning =
+    new QLabel(tr("This game was not scanned by DuckStation. Some functionality is not available."), this);
+  warning_layout->addWidget(warning, 1);
+  m_ui.mainLayout->addLayout(warning_layout, insert_row, 0, 1, 3);
+
+  if (spacer_item)
+    m_ui.mainLayout->addItem(spacer_item, insert_row + 1, 0, 1, 3);
+}
+
+void GameSummaryWidget::onCompatibilityCommentsClicked()
+{
+  QDialog* const dlg = new QDialog(this);
+  dlg->setAttribute(Qt::WA_DeleteOnClose);
+  dlg->resize(QSize(700, 400));
+  dlg->setWindowTitle(tr("Compatibility Report"));
+
+  QVBoxLayout* layout = new QVBoxLayout(dlg);
+
+  QTextEdit* text = new QTextEdit(dlg);
+  text->setMarkdown(m_compatibility_comments);
+  text->setReadOnly(true);
+  layout->addWidget(text, 1);
+
+  QDialogButtonBox* bb = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+  connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::accept);
+  layout->addWidget(bb);
+
+  dlg->open();
+}
+
+void GameSummaryWidget::onInputProfileChanged(int index)
+{
+  SettingsInterface* sif = m_dialog->getSettingsInterface();
+
+  if (index == 0)
+  {
+    // Use global settings.
+    sif->DeleteValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "InputProfileName");
+    sif->DeleteValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "UseGameSettingsForController");
+  }
+  else if (index == 1)
+  {
+    // Per-game configuration.
+    sif->DeleteValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "InputProfileName");
+    sif->SetBoolValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "UseGameSettingsForController", true);
+
+    if (!sif->GetBoolValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "GameSettingsInitialized", false))
+    {
+      sif->SetBoolValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "GameSettingsInitialized", true);
+
+      {
+        const auto lock = Core::GetSettingsLock();
+        SettingsInterface* base_sif = Core::GetBaseSettingsLayer();
+        InputManager::CopyConfiguration(sif, *base_sif, true, false, true, false);
+
+        QtUtils::AsyncMessageBox(this, QMessageBox::Information, window()->windowTitle(),
+                                 tr("Per-game controller configuration initialized with global settings."));
+      }
+    }
+  }
+  else
+  {
+    // Input profile.
+    sif->SetStringValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "InputProfileName",
+                        m_ui.inputProfile->itemText(index).toUtf8());
+    sif->DeleteValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "UseGameSettingsForController");
+  }
+
+  m_dialog->saveGameSettings();
+  m_dialog->onMultitapModeChanged(m_dialog->getEffectiveMultitapMode());
+  m_ui.editInputProfile->setEnabled(index > 0);
+}
+
+void GameSummaryWidget::onEditInputProfileClicked()
+{
+  if (m_dialog->getBoolValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "UseGameSettingsForController", std::nullopt)
+        .value_or(false))
+  {
+    // Edit game configuration.
+    ControllerSettingsWindow* window =
+      ControllerSettingsWindow::editControllerSettingsForGame(this, m_dialog->getSettingsInterface());
+    connect(window, &ControllerSettingsWindow::multitapModeChanged, m_dialog, &SettingsWindow::onMultitapModeChanged);
+  }
+  else if (const std::optional<std::string> profile_name =
+             m_dialog->getStringValue(Settings::CONTROLLER_PORTS_SECTION_NAME, "InputProfileName", std::nullopt);
+           profile_name.has_value() && !profile_name->empty())
+  {
+    // Edit input profile.
+    ControllerSettingsWindow* window = g_main_window->openInputProfileEditor(profile_name.value());
+    connect(window, &ControllerSettingsWindow::multitapModeChanged, m_dialog, &SettingsWindow::onMultitapModeChanged);
+  }
+}
+
+void GameSummaryWidget::onComputeHashClicked()
+{
+  // Search redump when it's already computed.
+  QTreeWidgetItem* const first_track = m_ui.tracks->topLevelItem(0);
+  if (first_track && !first_track->text(5).isEmpty())
+  {
+    QtUtils::OpenURL(this, GameDatabase::GetRedumpSearchURL(first_track->text(4).toStdString()).c_str());
+    return;
+  }
+
+  m_ui.computeHashes->setEnabled(false);
+
+  QtAsyncTaskWithProgressDialog::create(
+    this, TRANSLATE_SV("GameSummaryWidget", "Verifying Image"), {}, false, true, 1, 0, 0.0f, true,
+    [this, path = m_path, serial = m_dialog->getGameSerial()](ProgressCallback* progress) {
+      Error error;
+      GameDatabase::TrackVerificationResult verification;
+      std::unique_ptr<CDImage> image = CDImage::Open(path.c_str(), false, &error);
+      const bool result = image && GameDatabase::VerifyImage(image.get(), serial, &verification, progress, &error);
+      const bool cancelled = (!result && progress->IsCancelled());
+      return [this, verification = std::move(verification), error = std::move(error), result, cancelled]() {
+        processHashResults(verification, result, cancelled, error);
+      };
+    });
+}
+
+void GameSummaryWidget::processHashResults(const GameDatabase::TrackVerificationResult& verification, bool result,
+                                           bool cancelled, const Error& error)
+{
+  m_ui.computeHashes->setEnabled(true);
+
+  if (!result)
+  {
+    if (!cancelled)
+    {
+      QtUtils::AsyncMessageBox(this, QMessageBox::Critical, tr("Hash Calculation Failed"),
+                               QString::fromStdString(error.GetDescription()));
+    }
+
+    return;
+  }
+
+  if (!verification.summary.empty())
+  {
+    QLabel* const warning_icon = new QLabel(this);
+    warning_icon->setPixmap(QIcon(QtHost::GetResourceQPath("images/warning.svg", true)).pixmap(16, 16));
+    m_ui.verifyLayout->insertWidget(0, warning_icon);
+    if (verification.serial.empty())
+    {
+      QFont font = m_ui.tracksLabel->font();
+      font.setBold(true);
+      m_ui.tracksLabel->setFont(font);
+    }
+    m_ui.tracksLabel->setText(QString::fromStdString(verification.summary));
+  }
+
+  // update in ui
+  for (size_t i = 0; i < verification.track_hashes.size(); i++)
+  {
+    QTreeWidgetItem* const row = m_ui.tracks->topLevelItem(static_cast<int>(i));
+    row->setText(4, QString::fromStdString(CDImageHasher::HashToString(verification.track_hashes[i])));
+
+    QBrush brush;
+    if (verification.track_matches[i])
+    {
+      brush = QColor(0, 200, 0);
+      row->setText(5, u"\u2713"_s);
+    }
+    else
+    {
+      brush = QColor(200, 0, 0);
+      row->setText(5, u"\u2715"_s);
+    }
+    row->setForeground(4, brush);
+    row->setForeground(5, brush);
+  }
+
+  m_ui.computeHashes->setIcon(QIcon(u":/icons/monochrome/svg/mag-line.svg"_s));
+  m_ui.computeHashes->setText(tr("Search on redump.info"));
+}

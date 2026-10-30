@@ -1,0 +1,86 @@
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#pragma once
+
+#include "ui_memoryscannerwindow.h"
+
+#include "core/memory_scanner.h"
+
+#include <QtCore/QTimer>
+#include <QtWidgets/QPushButton>
+#include <QtWidgets/QTableWidget>
+#include <QtWidgets/QWidget>
+#include <optional>
+
+class MemoryScannerWindow : public QWidget
+{
+  Q_OBJECT
+
+public:
+  MemoryScannerWindow();
+  ~MemoryScannerWindow();
+
+Q_SIGNALS:
+  void closed();
+
+protected:
+  void closeEvent(QCloseEvent* event) override;
+
+private:
+  enum : int
+  {
+    MAX_DISPLAYED_SCAN_RESULTS = 5000,
+    SCAN_INTERVAL = 100,
+  };
+
+  void onSystemStarted();
+  void onSystemDestroyed();
+
+  void newSearchClicked();
+  void searchAgainClicked();
+  void resetSearchClicked();
+
+  void addToWatchClicked();
+  void addManualWatchAddressClicked();
+  void freezeWatchClicked();
+  void removeWatchClicked();
+  void scanCurrentItemChanged(QTableWidgetItem* current, QTableWidgetItem* previous);
+  void scanItemChanged(QTableWidgetItem* item);
+  void scanItemDoubleClicked(QTableWidgetItem* item);
+  void watchCurrentItemChanged(QTableWidgetItem* current, QTableWidgetItem* previous);
+  void watchItemChanged(QTableWidgetItem* item);
+  void watchItemDoubleClicked(QTableWidgetItem* item);
+  void updateScanValue();
+  void updateScanUi();
+
+  void setupAdditionalUi();
+  void connectUi();
+  void enableUi(bool enabled);
+  void updateResults();
+  void updateResultsValues();
+  void updateWatch();
+  void updateWatchValues();
+
+  void tryOpenAddressInMemoryEditor(VirtualMemoryAddress address);
+
+  int getSelectedResultIndexFirst() const;
+  int getSelectedResultIndexLast() const;
+  int getSelectedWatchIndexFirst() const;
+  int getSelectedWatchIndexLast() const;
+
+  QTableWidgetItem* createValueItem(MemoryAccessSize size, u32 value, bool is_signed, bool editable) const;
+
+  std::string getWatchSavePath(bool saving);
+  void saveWatches();
+  void reloadWatches();
+  void clearWatches();
+
+  Ui::MemoryScannerWindow m_ui;
+
+  MemoryScan m_scanner;
+  MemoryWatchList m_watch;
+
+  QTimer* m_update_timer = nullptr;
+  std::string m_watch_save_filename;
+};

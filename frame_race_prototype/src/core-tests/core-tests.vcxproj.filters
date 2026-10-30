@@ -1,0 +1,25 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\..\dep\googletest\src\gtest_main.cc" />
+    <ClCompile Include="cdrom_tests.cpp" />
+    <ClCompile Include="cheats_tests.cpp" />
+    <ClCompile Include="controller_helpers_tests.cpp" />
+    <ClCompile Include="cpu_disasm_tests.cpp" />
+    <ClCompile Include="cpu_pgxp_tests.cpp" />
+    <ClCompile Include="gpu_sw_rasterizer_tests.cpp" />
+    <ClCompile Include="gpu_tests.cpp" />
+    <ClCompile Include="gte_tests.cpp" />
+    <ClCompile Include="gte_timing_tests.cpp" />
+    <ClCompile Include="stub_host.cpp" />
+    <ClCompile Include="spu_tests.cpp" />
+    <ClCompile Include="lightgun_controller_tests.cpp" />
+    <ClCompile Include="negcon_base_tests.cpp" />
+    <ClCompile Include="psxdiag_tests.cpp" />
+    <ClCompile Include="mdec_tests.cpp" />
+    <ClCompile Include="timers_tests.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="CMakeLists.txt" />
+  </ItemGroup>
+</Project>

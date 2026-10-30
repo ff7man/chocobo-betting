@@ -1,0 +1,430 @@
+// SPDX-FileCopyrightText: 2002-2023 PCSX2 Dev Team, 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "cocoa_tools.h"
+#include "assert.h"
+#include "error.h"
+#include "log.h"
+#include "small_string.h"
+#include "threading.h"
+
+#include "fmt/format.h"
+
+#include <AppKit/AppKit.h>
+#include <Cocoa/Cocoa.h>
+#include <CoreFoundation/CFUserNotification.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>
+#include <QuartzCore/QuartzCore.h>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mutex>
+#include <vector>
+
+#if __has_feature(objc_arc)
+#error ARC should not be enabled.
+#endif
+
+NSString* CocoaTools::StringViewToNSString(std::string_view str)
+{
+  if (str.empty())
+    return nil;
+
+  return [[[NSString alloc] initWithBytes:str.data()
+                                   length:static_cast<NSUInteger>(str.length())
+                                 encoding:NSUTF8StringEncoding] autorelease];
+}
+
+std::string CocoaTools::NSErrorToString(NSError* error)
+{
+  return fmt::format("{}: {}", static_cast<u32>(error.code), [error.description UTF8String]);
+}
+
+void CocoaTools::NSErrorToErrorObject(Error* errptr, std::string_view message, NSError* error)
+{
+  Error::SetStringFmt(errptr, "{}NSError Code {}: {}", message, static_cast<u32>(error.code),
+                      [error.description UTF8String]);
+}
+
+bool CocoaTools::MoveFile(const char* source, const char* destination, Error* error)
+{
+  @autoreleasepool
+  {
+    NSError* nserror;
+    const BOOL result = [[NSFileManager defaultManager] moveItemAtPath:[NSString stringWithUTF8String:source]
+                                                                toPath:[NSString stringWithUTF8String:destination]
+                                                                 error:&nserror];
+    if (!result)
+    {
+      Error::SetString(error, NSErrorToString(nserror));
+      return false;
+    }
+
+    return true;
+  }
+}
+
+// Used for present timing.
+static const struct mach_timebase_info s_timebase_info = []() {
+  struct mach_timebase_info val;
+  const kern_return_t res = mach_timebase_info(&val);
+  Assert(res == KERN_SUCCESS);
+  return val;
+}();
+
+u64 CocoaTools::ConvertMachTimeBaseToNanoseconds(u64 time)
+{
+  return ((time * s_timebase_info.numer) / s_timebase_info.denom);
+}
+
+u64 CocoaTools::ConvertNanosecondsToMachTimeBase(u64 time)
+{
+  return ((time * s_timebase_info.denom) / s_timebase_info.numer);
+}
+
+std::optional<std::string> CocoaTools::GetBundlePath()
+{
+  std::optional<std::string> ret;
+  @autoreleasepool
+  {
+    NSBundle* bundle = [NSBundle mainBundle];
+    if (!bundle)
+      return std::nullopt;
+
+    // A real macOS application bundle should have CFBundlePackageType = APPL.
+    NSString* packageType = [bundle objectForInfoDictionaryKey:@"CFBundlePackageType"];
+    if (![packageType isEqualToString:@"APPL"])
+      return std::nullopt;
+
+    NSURL* url = [bundle bundleURL];
+    if (url)
+      ret = std::string([url fileSystemRepresentation]);
+  }
+  return ret;
+}
+
+std::optional<std::string> CocoaTools::GetNonTranslocatedBundlePath()
+{
+  // See https://objective-see.com/blog/blog_0x15.html
+  std::optional<std::string> ret;
+  @autoreleasepool
+  {
+    NSURL* url = [NSURL fileURLWithPath:[[NSBundle mainBundle] bundlePath]];
+    if (!url)
+      return ret;
+
+    if (void* handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY))
+    {
+      auto IsTranslocatedURL =
+        reinterpret_cast<Boolean (*)(CFURLRef path, bool* isTranslocated, CFErrorRef* __nullable error)>(
+          dlsym(handle, "SecTranslocateIsTranslocatedURL"));
+      auto CreateOriginalPathForURL =
+        reinterpret_cast<CFURLRef __nullable (*)(CFURLRef translocatedPath, CFErrorRef* __nullable error)>(
+          dlsym(handle, "SecTranslocateCreateOriginalPathForURL"));
+      bool is_translocated = false;
+      if (IsTranslocatedURL)
+        IsTranslocatedURL((__bridge CFURLRef)url, &is_translocated, nullptr);
+      if (is_translocated)
+      {
+        if (CFURLRef actual = CreateOriginalPathForURL((__bridge CFURLRef)url, nullptr))
+          url = (__bridge NSURL*)actual;
+      }
+      dlclose(handle);
+    }
+
+    ret = std::string([url fileSystemRepresentation]);
+  }
+
+  return ret;
+}
+
+bool CocoaTools::LaunchApplication(std::string_view path, std::span<const std::string_view> args, Error* error)
+{
+  @autoreleasepool
+  {
+    if (path.empty())
+    {
+      Error::SetString(error, "Cannot launch an application with an empty path.");
+      return false;
+    }
+
+    NSMutableArray<NSString*>* const launch_args = [NSMutableArray arrayWithCapacity:args.size()];
+    for (const std::string_view& arg : args)
+      [launch_args addObject:arg.empty() ? @"" : StringViewToNSString(arg)];
+
+    NSWorkspaceOpenConfiguration* const configuration = [NSWorkspaceOpenConfiguration configuration];
+    [configuration setActivates:YES];
+    [configuration setAllowsRunningApplicationSubstitution:NO];
+    [configuration setCreatesNewApplicationInstance:YES];
+    // Callers present launch failures in their own UI. Asking LaunchServices to present them would result in a
+    // duplicate system alert followed by the DuckStation/Updater error dialog.
+    [configuration setPromptsUserIfNeeded:NO];
+    [configuration setArguments:launch_args];
+
+    // NSWorkspace's completion handler runs on a concurrent queue, so it is safe to wait here. Waiting for the
+    // callback ensures that callers do not exit until LaunchServices has confirmed that the replacement app started.
+    dispatch_semaphore_t const completion_semaphore = dispatch_semaphore_create(0);
+    __block bool launch_succeeded = false;
+    __block NSError* launch_error = nil;
+    [[NSWorkspace sharedWorkspace]
+      openApplicationAtURL:[NSURL fileURLWithPath:StringViewToNSString(path) isDirectory:YES]
+             configuration:configuration
+         completionHandler:^(NSRunningApplication* app, NSError* nserror) {
+           launch_succeeded = (app != nil && nserror == nil);
+           launch_error = [nserror retain];
+           dispatch_semaphore_signal(completion_semaphore);
+         }];
+    dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
+
+    if (!launch_succeeded)
+    {
+      if (launch_error)
+        Error::SetStringFmt(error, "Failed to launch '{}': {}", path, NSErrorToString(launch_error));
+      else
+        Error::SetStringFmt(error, "Failed to launch '{}'.", path);
+    }
+    [launch_error release];
+
+#if !OS_OBJECT_USE_OBJC
+    dispatch_release(completion_semaphore);
+#endif
+
+    return launch_succeeded;
+  }
+}
+
+std::optional<std::pair<int, int>> CocoaTools::GetViewSizeInPixels(const void* view)
+{
+  std::optional<std::pair<int, int>> ret;
+  if (view)
+  {
+    NSView* nsview = (__bridge NSView*)view;
+    const NSSize size = [nsview convertSizeToBacking:nsview.frame.size];
+    ret = std::make_pair(static_cast<int>(size.width), static_cast<int>(size.height));
+  }
+
+  return ret;
+}
+
+std::optional<double> CocoaTools::GetViewRealScalingFactor(const void* view)
+{
+  if (!view)
+    return std::nullopt;
+
+  NSView* const nsview = (__bridge NSView*)view;
+  NSWindow* const nswindow = nsview.window;
+  if (nswindow == nil)
+    return std::nullopt;
+
+  NSScreen* const nsscreen = nswindow.screen;
+  if (nsscreen == nil)
+    return std::nullopt;
+
+  const u32 did = [[nsscreen.deviceDescription valueForKey:@"NSScreenNumber"] unsignedIntValue];
+  const NSArray* all_modes = (__bridge NSArray*)CGDisplayCopyAllDisplayModes(did, nil);
+  if (all_modes == nil)
+  {
+    GENERIC_LOG(Log::Channel::WindowInfo, Log::Level::Dev, Log::Color::Default,
+                "GetViewRealScalingFactor(): CGDisplayCopyAllDisplayModes() failed");
+    return std::nullopt;
+  }
+
+  // Prefer the native mode, the largest mode can be larger than the panel.
+  u32 native_width = 0, native_height = 0;
+  bool found_native = false;
+  for (NSUInteger i = 0; i < all_modes.count; i++)
+  {
+    const CGDisplayModeRef mode = (CGDisplayModeRef)all_modes[i];
+    const u32 mode_width = static_cast<u32>(CGDisplayModeGetPixelWidth(mode));
+    found_native = (CGDisplayModeGetIOFlags(mode) & kDisplayModeNativeFlag) != 0;
+    if (found_native || mode_width > native_width)
+    {
+      native_width = mode_width;
+      native_height = static_cast<u32>(CGDisplayModeGetPixelHeight(mode));
+      if (found_native)
+        break;
+    }
+  }
+  CFRelease(all_modes);
+  if (native_width == 0 || native_height == 0)
+  {
+    GENERIC_LOG(Log::Channel::WindowInfo, Log::Level::Dev, Log::Color::Default,
+                "GetViewRealScalingFactor(): Native size is zero");
+    return std::nullopt;
+  }
+
+  // Rotated displays have a portrait frame, the modes may not be.
+  const NSSize frame_size = nsscreen.frame.size;
+  if ((frame_size.width < frame_size.height) != (native_width < native_height))
+    std::swap(native_width, native_height);
+
+  // Use the smaller axis, modes with a different aspect ratio to the panel are letterboxed/pillarboxed.
+  // Sanity check: Scale should not be less than 100%, and rendering above the backing scale would just be downsampled.
+  const CGFloat scale = std::min(static_cast<CGFloat>(native_width) / frame_size.width,
+                                 static_cast<CGFloat>(native_height) / frame_size.height);
+  GENERIC_LOG(Log::Channel::WindowInfo, Log::Level::Dev, Log::Color::Default,
+              "GetViewRealScalingFactor(): Native={}x{}, IsNative={}, Frame={}x{}, Scale={}, BackingScale={}",
+              native_width, native_height, found_native, frame_size.width, frame_size.height, scale,
+              nsscreen.backingScaleFactor);
+  if (scale < 1.0f || scale > nsscreen.backingScaleFactor)
+    return std::nullopt;
+
+  return static_cast<double>(scale);
+}
+
+void* CocoaTools::CreateMetalLayer(void* view, Error* error)
+{
+  // Punt off to main thread if we're not calling from it already.
+  if (![NSThread isMainThread])
+  {
+    void* ret;
+    dispatch_sync(dispatch_get_main_queue(), [&ret, view, error]() { ret = CreateMetalLayer(view, error); });
+    return ret;
+  }
+
+  CAMetalLayer* layer = [[CAMetalLayer layer] retain];
+  if (layer == nil)
+  {
+    Error::SetStringView(error, "Failed to create CAMetalLayer");
+    return nullptr;
+  }
+
+  NSView* nsview = (__bridge NSView*)view;
+  [nsview setWantsLayer:TRUE];
+  [nsview setLayer:layer];
+  [layer setContentsScale:[[[nsview window] screen] backingScaleFactor]];
+
+  return layer;
+}
+
+void CocoaTools::DestroyMetalLayer(void* view, void* layer)
+{
+  // Punt off to main thread if we're not calling from it already.
+  if (![NSThread isMainThread])
+  {
+    dispatch_sync(dispatch_get_main_queue(), [view, layer]() { DestroyMetalLayer(view, layer); });
+    return;
+  }
+
+  NSView* nsview = (__bridge NSView*)view;
+  CAMetalLayer* clayer = (CAMetalLayer*)layer;
+  [nsview setLayer:nil];
+  [nsview setWantsLayer:NO];
+  [clayer release];
+}
+
+static Threading::Mutex s_assertion_mutex;
+
+static bool SuspendOtherThreads(std::vector<thread_t>* suspended_threads)
+{
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t thread_count = 0;
+  if (task_threads(mach_task_self(), &threads, &thread_count) != KERN_SUCCESS)
+    return false;
+
+  const thread_t current_thread = mach_thread_self();
+  if (current_thread == MACH_PORT_NULL)
+  {
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++)
+      mach_port_deallocate(mach_task_self(), threads[i]);
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), thread_count * sizeof(thread_t));
+    return false;
+  }
+  // Keep push_back allocation-free once any thread is suspended. Suspending arbitrary threads can still deadlock if
+  // one owns a process-wide lock needed by Core Foundation, so keep the work performed while they are suspended to a
+  // minimum.
+  suspended_threads->reserve(thread_count);
+
+  for (mach_msg_type_number_t i = 0; i < thread_count; i++)
+  {
+    if (threads[i] != current_thread && thread_suspend(threads[i]) == KERN_SUCCESS)
+      suspended_threads->push_back(threads[i]);
+    else
+      mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), thread_count * sizeof(thread_t));
+  mach_port_deallocate(mach_task_self(), current_thread);
+  return true;
+}
+
+static void ResumeOtherThreads(const std::vector<thread_t>& suspended_threads)
+{
+  for (thread_t thread : suspended_threads)
+  {
+    thread_resume(thread);
+    mach_port_deallocate(mach_task_self(), thread);
+  }
+}
+
+static CFOptionFlags ShowBlockingAssertionAlert(CFStringRef title, CFStringRef text, CFStringRef alternate_button,
+                                                CFStringRef other_button, std::vector<thread_t>* suspended_threads)
+{
+  CFOptionFlags response = kCFUserNotificationCancelResponse;
+  if (!SuspendOtherThreads(suspended_threads))
+    std::abort();
+
+  const SInt32 status =
+    CFUserNotificationDisplayAlert(0, kCFUserNotificationStopAlertLevel, nullptr, nullptr, nullptr, title, text,
+                                   CFSTR("Abort"), alternate_button, other_button, &response);
+  if (status != 0)
+    std::abort();
+  return (response & 0x3);
+}
+
+static void ShowAssertionAlert(const char* szMessage, const char* szFunction, const char* szFile, unsigned uLine)
+{
+  @autoreleasepool
+  {
+    NSString* text = [NSString stringWithFormat:@"%s in function %s (%s:%u)\nPress Abort to exit, Break to break to "
+                                                @"debugger, or Ignore to attempt to continue.",
+                                                szMessage, szFunction, szFile, uLine];
+    std::vector<thread_t> suspended_threads;
+    const CFOptionFlags response = ShowBlockingAssertionAlert(CFSTR("Assertion Failed"), (__bridge CFStringRef)text,
+                                                              CFSTR("Break"), CFSTR("Ignore"), &suspended_threads);
+    if (response != kCFUserNotificationAlternateResponse && response != kCFUserNotificationOtherResponse)
+      std::abort();
+    if (response == kCFUserNotificationAlternateResponse)
+      __builtin_debugtrap();
+    ResumeOtherThreads(suspended_threads);
+  }
+}
+
+void Y_OnAssertFailed(const char* szMessage, const char* szFunction, const char* szFile, unsigned uLine)
+{
+  std::lock_guard lock(s_assertion_mutex);
+
+  char szMsg[512];
+  std::snprintf(szMsg, sizeof(szMsg), "%s in function %s (%s:%u)\n", szMessage, szFunction, szFile, uLine);
+  std::fputs(szMsg, stderr);
+  std::fflush(stderr);
+
+  ShowAssertionAlert(szMessage, szFunction, szFile, uLine);
+}
+
+[[noreturn]] void Y_OnPanicReached(const char* szMessage, const char* szFunction, const char* szFile, unsigned uLine)
+{
+  std::lock_guard lock(s_assertion_mutex);
+
+  char szMsg[512];
+  std::snprintf(szMsg, sizeof(szMsg), "%s in function %s (%s:%u)\n", szMessage, szFunction, szFile, uLine);
+  std::fputs(szMsg, stderr);
+  std::fflush(stderr);
+
+  @autoreleasepool
+  {
+    NSString* text =
+      [NSString stringWithFormat:@"%s in function %s (%s:%u)\nDo you want to attempt to break into a debugger?",
+                                 szMessage, szFunction, szFile, uLine];
+    std::vector<thread_t> suspended_threads;
+    if (ShowBlockingAssertionAlert(CFSTR("Critical Error"), (__bridge CFStringRef)text, CFSTR("Break"), nullptr,
+                                   &suspended_threads) == kCFUserNotificationAlternateResponse)
+    {
+      __builtin_debugtrap();
+    }
+  }
+
+  std::abort();
+}

@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+# SPDX-License-Identifier: CC-BY-NC-ND-4.0 + Packaging Restriction
+#
+# NOTE: In addition to the terms of CC-BY-NC-ND-4.0, you may not use this file to create
+# packages or build recipes without explicit permission from the copyright holder.
+
+set(_saved_CMAKE_MESSAGE_LOG_LEVEL ${CMAKE_MESSAGE_LOG_LEVEL})
+set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
+
+add_subdirectory(fmt EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(fmt)
+# Prevent fmt from being built with exceptions, or being thrown at call sites.
+target_compile_definitions(fmt PUBLIC
+  "FMT_EXCEPTIONS=0"
+  "FMT_USE_RTTI=0"
+  "FMT_CPP_LIB_FILESYSTEM=0"
+)
+
+add_subdirectory(minizip EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(minizip)
+add_subdirectory(lzma EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(lzma)
+add_subdirectory(libchdr EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(libchdr)
+add_subdirectory(xxhash EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(xxhash)
+add_subdirectory(imgui EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(imgui)
+add_subdirectory(vulkan EXCLUDE_FROM_ALL)
+add_subdirectory(googletest EXCLUDE_FROM_ALL)
+add_subdirectory(fast_float EXCLUDE_FROM_ALL)
+add_subdirectory(reshadefx EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(reshadefx)
+add_subdirectory(rcheevos EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(rcheevos)
+add_subdirectory(rapidyaml EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(rapidyaml)
+add_subdirectory(cubeb EXCLUDE_FROM_ALL)
+disable_compiler_warnings_for_target(cubeb)
+disable_compiler_warnings_for_target(speex)
+
+if(ENABLE_OPENGL)
+  add_subdirectory(glad EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(glad)
+endif()
+
+if(CPU_ARCH_X64)
+  add_subdirectory(xbyak EXCLUDE_FROM_ALL)
+  add_subdirectory(zydis EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(zydis)
+endif()
+
+if(CPU_ARCH_ARM32 OR CPU_ARCH_ARM64)
+  add_subdirectory(vixl EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(vixl)
+endif()
+
+if(CPU_ARCH_RISCV64)
+  add_subdirectory(biscuit EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(biscuit)
+  add_subdirectory(riscv-disas EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(riscv-disas)
+endif()
+
+if(CPU_ARCH_LOONGARCH64)
+  add_subdirectory(lagoon EXCLUDE_FROM_ALL)
+  disable_compiler_warnings_for_target(lagoon)
+endif()
+
+set(CMAKE_MESSAGE_LOG_LEVEL ${_saved_CMAKE_MESSAGE_LOG_LEVEL})

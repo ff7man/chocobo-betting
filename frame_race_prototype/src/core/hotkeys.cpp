@@ -1,0 +1,873 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "achievements.h"
+#include "core.h"
+#include "cpu_code_cache.h"
+#include "cpu_core.h"
+#include "cpu_pgxp.h"
+#include "fullscreenui.h"
+#include "gpu.h"
+#include "gpu_hw_texture_cache.h"
+#include "gte.h"
+#include "host.h"
+#include "imgui_overlays.h"
+#include "settings.h"
+#include "spu.h"
+#include "system.h"
+#include "video_presenter.h"
+#include "video_thread.h"
+
+#include "util/gpu_device.h"
+#include "util/input_manager.h"
+#include "util/media_capture.h"
+#include "util/postprocessing.h"
+#include "util/translation.h"
+
+#include "common/error.h"
+#include "common/file_system.h"
+#include "common/threading.h"
+#include "common/timer.h"
+
+#include "IconsEmoji.h"
+#include "IconsFontAwesome.h"
+#include "fmt/format.h"
+
+#include <cmath>
+
+void Settings::SetDefaultHotkeyConfig(SettingsInterface& si)
+{
+  si.ClearSection(Settings::HOTKEYS_SECTION_NAME);
+
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "FastForward", "Keyboard/Tab");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "TogglePause", "Keyboard/Space");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "Screenshot", "Keyboard/F10");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "ToggleFullscreen", "Keyboard/F11");
+
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "OpenPauseMenu", "Keyboard/Escape");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "LoadSelectedSaveState", "Keyboard/F1");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "SaveSelectedSaveState", "Keyboard/F2");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "SelectPreviousSaveStateSlot", "Keyboard/F3");
+  si.SetStringValue(Settings::HOTKEYS_SECTION_NAME, "SelectNextSaveStateSlot", "Keyboard/F4");
+}
+
+static void HotkeyModifyResolutionScale(s32 increment)
+{
+  const u32 new_resolution_scale = std::clamp<u32>(
+    static_cast<u32>(static_cast<s32>(g_settings.gpu_resolution_scale) + increment), 1, GPU::MAX_RESOLUTION_SCALE);
+  if (new_resolution_scale == g_settings.gpu_resolution_scale)
+    return;
+
+  const Settings old_settings = g_settings;
+  g_settings.gpu_resolution_scale = Truncate8(new_resolution_scale);
+
+  if (System::IsValid())
+  {
+    VideoThread::UpdateSettings(true, false, false);
+    System::ClearMemorySaveStates(true, false);
+  }
+}
+
+static void HotkeyToggleOSD()
+{
+  g_settings.display_show_fps ^= Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowFPS", false);
+  g_settings.display_show_speed ^= Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowSpeed", false);
+  g_settings.display_show_gpu_stats ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowGPUStatistics", false);
+  g_settings.display_show_resolution ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowResolution", false);
+  g_settings.display_show_latency_stats ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowLatencyStatistics", false);
+  g_settings.display_show_cpu_usage ^= Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowCPU", false);
+  g_settings.display_show_gpu_usage ^= Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowGPU", false);
+  g_settings.display_show_frame_times ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowFrameTimes", false);
+  g_settings.display_show_status_indicators ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowStatusIndicators", true);
+  g_settings.display_show_inputs ^= Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowInputs", false);
+  g_settings.display_show_enhancements ^=
+    Core::GetBoolSettingValue(Settings::DISPLAY_SECTION_NAME, "ShowEnhancements", false);
+
+  VideoThread::UpdateSettings(true, false, false);
+}
+
+static bool HotkeyCheckRewindAvailability(bool enabled)
+{
+  if (g_settings.rewind_enable)
+    return true;
+
+  // don't do anything on key release
+  if (!enabled)
+    return false;
+
+  // figure out why it's disabled...
+  std::string summary;
+  const bool rewind_actually_enabled =
+    Core::GetBoolSettingValue(Settings::INTERFACE_SECTION_NAME, "RewindEnable", false);
+  if (rewind_actually_enabled)
+  {
+    if (g_settings.IsRunaheadEnabled())
+    {
+      summary = TRANSLATE_STR("OSDMessage", "Rewinding is disabled while runahead is enabled.");
+    }
+    else if (g_settings.disable_all_enhancements)
+    {
+      summary = TRANSLATE_STR("OSDMessage", "Rewinding is disabled while safe mode is enabled.");
+    }
+    else if (Achievements::IsHardcoreModeActive())
+    {
+      // because this is keypress-based, don't enable it on accept
+      Achievements::ConfirmHardcoreModeDisableAsync("Rewinding", {});
+      return false;
+    }
+  }
+  else
+  {
+    summary = TRANSLATE_STR("OSDMessage", "Rewinding is not enabled.");
+  }
+
+  Host::AddIconOSDMessage(OSDMessageType::Warning, "SetRewindState", ICON_EMOJI_WARNING,
+                          TRANSLATE_STR("OSDMessage", "Rewinding unavailable."), std::move(summary));
+  return false;
+}
+
+static constexpr const HotkeyInfo s_hotkey_list[] = {
+
+  {"OpenPauseMenu", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Open Pause Menu"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       FullscreenUI::OpenPauseMenu();
+   }},
+
+  {"TogglePauseMenu", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Pause Menu"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       FullscreenUI::TogglePauseMenu();
+   },
+   true},
+
+  {"OpenCheatsMenu", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Cheat List"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       FullscreenUI::ToggleCheatsMenu();
+   },
+   true},
+
+  {"OpenAchievements", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Achievement List"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       FullscreenUI::ToggleAchievementsWindow();
+   },
+   true},
+
+  {"OpenLeaderboards", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Leaderboard List"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       FullscreenUI::ToggleLeaderboardsWindow();
+   },
+   true},
+
+  {"Screenshot", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Save Screenshot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::SaveScreenshot();
+   }},
+
+  {"TogglePause", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Pause"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::CanPauseSystem(true))
+       System::PauseSystem(!System::IsPaused());
+   }},
+
+  {"ToggleFullscreen", TRANSLATE_NOOP("Hotkeys", "Interface"), TRANSLATE_NOOP("Hotkeys", "Toggle Fullscreen"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       VideoThread::SetFullscreen(!VideoThread::IsFullscreen());
+   }},
+
+  {"FastForward", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Fast Forward (Hold)"),
+   [](InputButtonEvent event) { System::SetFastForwardEnabled(event == InputButtonEvent::Pressed); }},
+
+  {"ToggleFastForward", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Fast Forward (Toggle)"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::SetFastForwardEnabled(!System::IsFastForwardEnabled());
+   }},
+
+  {"Turbo", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Turbo (Hold)"),
+   [](InputButtonEvent event) { System::SetTurboEnabled(event == InputButtonEvent::Pressed); }},
+
+  {"ToggleTurbo", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Turbo (Toggle)"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::SetTurboEnabled(!System::IsTurboEnabled());
+   }},
+
+  {"PowerOff", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Power Off System"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       Host::RequestSystemShutdown(true, g_settings.save_state_on_exit, true);
+   }},
+
+  {"Reset", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Restart Game"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       Host::RunOnCoreThread(System::ResetSystem);
+   }},
+
+  {"ChangeDisc", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Change Disc"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       FullscreenUI::OpenDiscChangeMenu();
+   }},
+
+  {"SwitchToPreviousDisc", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Switch to Previous Disc"),
+   [](InputButtonEvent event) {
+     // Defer because otherwise the hotkey might be invalidated by config change.
+     if (event == InputButtonEvent::Released)
+       Host::RunOnCoreThread([]() { System::SwitchToPreviousDisc(true); });
+   }},
+
+  {"SwitchToNextDisc", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Switch to Next Disc"),
+   [](InputButtonEvent event) {
+     // Defer because otherwise the hotkey might be invalidated by config change.
+     if (event == InputButtonEvent::Released)
+       Host::RunOnCoreThread([]() { System::SwitchToNextDisc(true); });
+   }},
+
+  {"Rewind", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Rewind"),
+   [](InputButtonEvent event) {
+     const bool enabled = (event == InputButtonEvent::Pressed);
+     if (HotkeyCheckRewindAvailability(enabled))
+       System::SetRewindState(enabled);
+   }},
+
+  {"FrameStep", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Frame Step"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::FrameStep();
+   }},
+
+  {"ToggleMediaCapture", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Media Capture"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+     {
+       if (System::GetMediaCapture())
+         System::StopMediaCapture();
+       else
+         System::StartMediaCapture(MediaCaptureMode::AudioAndVideo);
+     }
+   }},
+
+  {"ToggleAudioCapture", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Audio Capture"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+     {
+       if (System::GetMediaCapture())
+         System::StopMediaCapture();
+       else
+         System::StartMediaCapture(MediaCaptureMode::AudioOnly);
+     }
+   }},
+
+  {"ToggleVideoCapture", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Toggle Video Capture"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+     {
+       if (System::GetMediaCapture())
+         System::StopMediaCapture();
+       else
+         System::StartMediaCapture(MediaCaptureMode::VideoOnly);
+     }
+   }},
+
+  {"SwapMemoryCards", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Swap Memory Card Slots"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::SwapMemoryCards();
+   }},
+
+  {"ToggleOverclocking", TRANSLATE_NOOP("Hotkeys", "System"),
+   TRANSLATE_NOOP("Hotkeys", "Toggle Clock Speed Control (Overclocking)"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid() && !Achievements::IsHardcoreModeActive())
+     {
+       g_settings.cpu_overclock_enable = !g_settings.cpu_overclock_enable;
+       g_settings.UpdateOverclockActive();
+       System::UpdateOverclock();
+
+       if (g_settings.cpu_overclock_enable)
+       {
+         const u32 percent = g_settings.GetCPUOverclockPercent();
+         const double clock_speed =
+           ((static_cast<double>(System::MASTER_CLOCK) * static_cast<double>(percent)) / 100.0) / 1000000.0;
+         Host::AddIconOSDMessage(
+           OSDMessageType::Quick, "ToggleOverclocking", ICON_FA_GAUGE_SIMPLE_HIGH,
+           fmt::format(TRANSLATE_FS("OSDMessage", "CPU clock speed control enabled ({:.3f} MHz)."), clock_speed));
+       }
+       else
+       {
+         Host::AddIconOSDMessage(
+           OSDMessageType::Quick, "ToggleOverclocking", ICON_FA_GAUGE_SIMPLE_HIGH,
+           fmt::format(TRANSLATE_FS("OSDMessage", "CPU clock speed control disabled ({:.3f} MHz)."),
+                       static_cast<double>(System::MASTER_CLOCK) / 1000000.0));
+       }
+     }
+   }},
+
+  {"IncreaseEmulationSpeed", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Increase Emulation Speed"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.emulation_speed += 0.1f;
+       System::UpdateSpeedLimiterState();
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "EmulationSpeedChange", ICON_FA_GAUGE,
+                               fmt::format(TRANSLATE_FS("OSDMessage", "Emulation speed set to {}%."),
+                                           static_cast<u32>(std::lround(g_settings.emulation_speed * 100.0f))));
+     }
+   }},
+
+  {"DecreaseEmulationSpeed", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Decrease Emulation Speed"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.emulation_speed =
+         std::max(g_settings.emulation_speed - 0.1f, Achievements::IsHardcoreModeActive() ? 1.0f : 0.1f);
+       System::UpdateSpeedLimiterState();
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "EmulationSpeedChange", ICON_FA_GAUGE,
+                               fmt::format(TRANSLATE_FS("OSDMessage", "Emulation speed set to {}%."),
+                                           static_cast<u32>(std::lround(g_settings.emulation_speed * 100.0f))));
+     }
+   }},
+
+  {"ResetEmulationSpeed", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Reset Emulation Speed"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.emulation_speed =
+         std::max(Core::GetFloatSettingValue(Settings::INTERFACE_SECTION_NAME, "EmulationSpeed", 1.0f),
+                  Achievements::IsHardcoreModeActive() ? 1.0f : 0.1f);
+       System::UpdateSpeedLimiterState();
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "EmulationSpeedChange", ICON_FA_GAUGE,
+                               fmt::format(TRANSLATE_FS("OSDMessage", "Emulation speed set to {}%."),
+                                           static_cast<u32>(std::lround(g_settings.emulation_speed * 100.0f))));
+     }
+   }},
+
+  {"RotateClockwise", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Rotate Display Clockwise"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+     {
+       g_settings.display_rotation = static_cast<DisplayRotation>((static_cast<u8>(g_settings.display_rotation) + 1) %
+                                                                  static_cast<u8>(DisplayRotation::Count));
+       VideoThread::UpdateSettings(true, false, false);
+     }
+   }},
+
+  {"RotateCounterclockwise", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Rotate Display Counterclockwise"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+     {
+       g_settings.display_rotation = (g_settings.display_rotation > static_cast<DisplayRotation>(0)) ?
+                                       static_cast<DisplayRotation>((static_cast<u8>(g_settings.display_rotation) - 1) %
+                                                                    static_cast<u8>(DisplayRotation::Count)) :
+                                       static_cast<DisplayRotation>(static_cast<u8>(DisplayRotation::Count) - 1);
+       VideoThread::UpdateSettings(true, false, false);
+     }
+   }},
+
+  {"ToggleOSD", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle On-Screen Display"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       HotkeyToggleOSD();
+   }},
+
+  {"ToggleSoftwareRendering", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Toggle Software Rendering"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       System::ToggleSoftwareRendering();
+   }},
+
+  {"TogglePGXP", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle PGXP"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       System::ClearMemorySaveStates(true, true);
+
+       // This is pretty yikes, if PGXP was off we'll have already disabled all the dependent settings.
+       g_settings.gpu_pgxp_enable = !g_settings.gpu_pgxp_enable;
+       {
+         const auto lock = Core::GetSettingsLock();
+         const SettingsInterface& si = *Core::GetSettingsInterface();
+         if (g_settings.gpu_pgxp_enable)
+           g_settings.LoadPGXPSettings(si);
+         g_settings.FixIncompatibleSettings(si, false);
+       }
+
+       VideoThread::UpdateSettings(true, false, false);
+
+       Host::AddKeyedOSDMessage(OSDMessageType::Quick, "TogglePGXP",
+                                g_settings.gpu_pgxp_enable ? TRANSLATE_STR("OSDMessage", "PGXP is now enabled.") :
+                                                             TRANSLATE_STR("OSDMessage", "PGXP is now disabled."));
+
+       if (g_settings.gpu_pgxp_enable)
+         CPU::PGXP::Initialize();
+       else
+         CPU::PGXP::Shutdown();
+
+       // we need to recompile all blocks if pgxp is toggled on/off
+       CPU::CodeCache::Reset();
+
+       // need to swap interpreters
+       System::InterruptExecution();
+     }
+   }},
+
+  {"TogglePGXPDepth", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle PGXP Depth Buffer"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       if (!g_settings.gpu_pgxp_enable)
+         return;
+
+       System::ClearMemorySaveStates(true, true);
+
+       g_settings.gpu_pgxp_depth_buffer = !g_settings.gpu_pgxp_depth_buffer;
+       VideoThread::UpdateSettings(true, false, false);
+
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "TogglePGXPDepth", ICON_FA_SITEMAP,
+                               g_settings.gpu_pgxp_depth_buffer ?
+                                 TRANSLATE_STR("OSDMessage", "PGXP Depth Buffer is now enabled.") :
+                                 TRANSLATE_STR("OSDMessage", "PGXP Depth Buffer is now disabled."));
+     }
+   }},
+
+  {"ToggleWidescreen", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle Widescreen"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::ToggleWidescreen();
+   }},
+
+  {"ToggleModulationCrop", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Toggle Texture Modulation Cropping"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.gpu_modulation_crop = !g_settings.gpu_modulation_crop;
+       VideoThread::UpdateSettings(true, false, false);
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "ToggleModulationCrop", ICON_FA_SWATCHBOOK,
+                               g_settings.gpu_modulation_crop ?
+                                 TRANSLATE_STR("OSDMessage", "Texture modulation cropping is now enabled.") :
+                                 TRANSLATE_STR("OSDMessage", "Texture modulation cropping is now disabled."));
+     }
+   }},
+
+  {"TogglePostProcessing", TRANSLATE_NOOP("Hotkeys", "Graphics"), TRANSLATE_NOOP("Hotkeys", "Toggle Post-Processing"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       VideoPresenter::TogglePostProcessing();
+   }},
+
+  {"ReloadPostProcessingShaders", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Reload Post Processing Shaders"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       VideoPresenter::ReloadPostProcessingSettings(true, true, true);
+   }},
+
+  {"ReloadTextureReplacements", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Reload Texture Replacements"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       VideoThread::RunOnThread([]() { GPUTextureCache::ReloadTextureReplacements(true, true); });
+   }},
+
+  {"IncreaseResolutionScale", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Increase Resolution Scale"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       HotkeyModifyResolutionScale(1);
+   }},
+
+  {"DecreaseResolutionScale", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Decrease Resolution Scale"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+       HotkeyModifyResolutionScale(-1);
+   }},
+
+  {"RecordSingleFrameGPUDump", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Record Single Frame GPU Trace"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       System::StartRecordingGPUDump(nullptr, 1);
+   }},
+
+  {"RecordMultiFrameGPUDump", TRANSLATE_NOOP("Hotkeys", "Graphics"),
+   TRANSLATE_NOOP("Hotkeys", "Record Multi-Frame GPU Trace"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Pressed)
+       System::StartRecordingGPUDump(nullptr, 0);
+     else
+       System::StopRecordingGPUDump();
+   }},
+
+  {"FreecamToggle", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Toggle"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && !Achievements::IsHardcoreModeActive())
+       GTE::SetFreecamEnabled(!GTE::IsFreecamEnabled());
+   }},
+
+  {"FreecamReset", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Reset"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && !Achievements::IsHardcoreModeActive())
+       GTE::ResetFreecam();
+   }},
+
+  {"FreecamMoveLeft", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Left"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(0, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"FreecamMoveRight", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Right"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(0, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamMoveUp", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Up"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(1, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"FreecamMoveDown", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Down"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(1, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamMoveForward", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Forward"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(2, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamMoveBackward", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Move Backward"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamMoveAxis(2, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"FreecamRotateLeft", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Rotate Left"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(1, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"FreecamRotateRight", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Rotate Right"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(1, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamRotateForward", TRANSLATE_NOOP("Hotkeys", "Free Camera"),
+   TRANSLATE_NOOP("Hotkeys", "Freecam Rotate Forward"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(0, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamRotateBackward", TRANSLATE_NOOP("Hotkeys", "Free Camera"),
+   TRANSLATE_NOOP("Hotkeys", "Freecam Rotate Backward"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(0, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"FreecamRollLeft", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Roll Left"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(2, (event == InputButtonEvent::Pressed) ? -1.0f : 0.0f);
+   }},
+
+  {"FreecamRollRight", TRANSLATE_NOOP("Hotkeys", "Free Camera"), TRANSLATE_NOOP("Hotkeys", "Freecam Roll Right"),
+   [](InputButtonEvent event) {
+     if (Achievements::IsHardcoreModeActive())
+       return;
+
+     GTE::SetFreecamRotateAxis(2, (event == InputButtonEvent::Pressed) ? 1.0f : 0.0f);
+   }},
+
+  {"AudioMute", TRANSLATE_NOOP("Hotkeys", "Audio"), TRANSLATE_NOOP("Hotkeys", "Toggle Mute"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.audio_output_muted = !g_settings.audio_output_muted;
+       const s32 volume = System::GetAudioOutputVolume();
+       SPU::GetOutputStream().SetOutputVolume(volume);
+       if (g_settings.audio_output_muted)
+       {
+         Host::AddIconOSDMessage(OSDMessageType::Quick, "AudioControlHotkey", ICON_EMOJI_MUTED_SPEAKER,
+                                 TRANSLATE_STR("OSDMessage", "Volume: Muted"));
+       }
+       else
+       {
+         Host::AddIconOSDMessage(OSDMessageType::Quick, "AudioControlHotkey", ICON_EMOJI_MEDIUM_VOLUME_SPEAKER,
+                                 fmt::format(TRANSLATE_FS("OSDMessage", "Volume: {}%"), volume));
+       }
+     }
+   }},
+
+  {"AudioCDAudioMute", TRANSLATE_NOOP("Hotkeys", "Audio"), TRANSLATE_NOOP("Hotkeys", "Toggle CD Audio Mute"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.cdrom_mute_cd_audio = !g_settings.cdrom_mute_cd_audio;
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "AudioControlHotkey",
+                               g_settings.cdrom_mute_cd_audio ? ICON_EMOJI_MUTED_SPEAKER :
+                                                                ICON_EMOJI_MEDIUM_VOLUME_SPEAKER,
+                               g_settings.cdrom_mute_cd_audio ? TRANSLATE_STR("OSDMessage", "CD Audio Muted.") :
+                                                                TRANSLATE_STR("OSDMessage", "CD Audio Unmuted."));
+     }
+   }},
+
+  {"AudioVolumeUp", TRANSLATE_NOOP("Hotkeys", "Audio"), TRANSLATE_NOOP("Hotkeys", "Volume Up"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.audio_output_muted = false;
+
+       const u8 volume = Truncate8(std::min<s32>(static_cast<s32>(System::GetAudioOutputVolume()) + 10, 200));
+       g_settings.audio_output_volume = volume;
+       g_settings.audio_fast_forward_volume = volume;
+       SPU::GetOutputStream().SetOutputVolume(volume);
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "AudioControlHotkey", ICON_EMOJI_HIGH_VOLUME_SPEAKER,
+                               fmt::format(TRANSLATE_FS("OSDMessage", "Volume: {}%"), volume));
+     }
+   }},
+
+  {"AudioVolumeDown", TRANSLATE_NOOP("Hotkeys", "Audio"), TRANSLATE_NOOP("Hotkeys", "Volume Down"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       g_settings.audio_output_muted = false;
+
+       const u8 volume = Truncate8(std::max<s32>(static_cast<s32>(System::GetAudioOutputVolume()) - 10, 0));
+       g_settings.audio_output_volume = volume;
+       g_settings.audio_fast_forward_volume = volume;
+       SPU::GetOutputStream().SetOutputVolume(volume);
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "AudioControlHotkey", ICON_EMOJI_MEDIUM_VOLUME_SPEAKER,
+                               fmt::format(TRANSLATE_FS("OSDMessage", "Volume: {}%"), volume));
+     }
+   }},
+
+  // NOTE: All save/load state hotkeys are deferred, because it can trigger setting reapply, which reloads bindings.
+  {"LoadSelectedSaveState", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Load From Selected Slot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       VideoThread::RunOnThread(SaveStateSelectorUI::LoadCurrentSlot);
+   }},
+
+  {"SaveSelectedSaveState", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Save To Selected Slot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       VideoThread::RunOnThread(SaveStateSelectorUI::SaveCurrentSlot);
+   }},
+
+  {"SelectPreviousSaveStateSlot", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Select Previous Save Slot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       VideoThread::RunOnThread([]() { SaveStateSelectorUI::SelectPreviousSlot(true); });
+   }},
+
+  {"SelectNextSaveStateSlot", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Select Next Save Slot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       VideoThread::RunOnThread([]() { SaveStateSelectorUI::SelectNextSlot(true); });
+   }},
+
+  {"SaveStateAndSelectNextSlot", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Save State and Select Next Slot"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       VideoThread::RunOnThread([]() {
+         SaveStateSelectorUI::SaveCurrentSlot();
+         SaveStateSelectorUI::SelectNextSlot(false);
+       });
+     }
+   }},
+
+  {"SelectNextSlotSaveState", TRANSLATE_NOOP("Hotkeys", "Save States"),
+   TRANSLATE_NOOP("Hotkeys", "Select Next Slot and Save State"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released && System::IsValid())
+     {
+       VideoThread::RunOnThread([]() {
+         SaveStateSelectorUI::SelectNextSlot(false);
+         SaveStateSelectorUI::SaveCurrentSlot();
+       });
+     }
+   }},
+
+  {"UndoLoadState", TRANSLATE_NOOP("Hotkeys", "Save States"), TRANSLATE_NOOP("Hotkeys", "Undo Load State"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Released)
+       Host::RunOnCoreThread(System::UndoLoadState);
+   }},
+
+  {"TogglePGXPCPU", TRANSLATE_NOOP("Hotkeys", "Debugging"), TRANSLATE_NOOP("Hotkeys", "Toggle PGXP CPU Mode"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Pressed && System::IsValid())
+     {
+       if (!g_settings.gpu_pgxp_enable)
+         return;
+
+       System::ClearMemorySaveStates(true, true);
+
+       // GPU thread is unchanged
+       g_settings.gpu_pgxp_cpu = !g_settings.gpu_pgxp_cpu;
+
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "TogglePGXPCPU", ICON_FA_BEZIER_CURVE,
+                               g_settings.gpu_pgxp_cpu ? TRANSLATE_STR("OSDMessage", "PGXP CPU mode is now enabled.") :
+                                                         TRANSLATE_STR("OSDMessage", "PGXP CPU mode is now disabled."));
+
+       CPU::PGXP::Shutdown();
+       CPU::PGXP::Initialize();
+
+       // we need to recompile all blocks if pgxp is
+       // toggled on/off
+       CPU::CodeCache::Reset();
+
+       // need to swap interpreters
+       System::InterruptExecution();
+     }
+   }},
+
+  {"TogglePGXPPreserveProjPrecision", TRANSLATE_NOOP("Hotkeys", "Debugging"),
+   TRANSLATE_NOOP("Hotkeys", "Toggle PGXP Preserve Projection Precision"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Pressed && System::IsValid())
+     {
+       if (!g_settings.gpu_pgxp_enable)
+         return;
+
+       // GPU thread is unchanged
+       g_settings.gpu_pgxp_preserve_proj_fp = !g_settings.gpu_pgxp_preserve_proj_fp;
+
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "TogglePGXPPreserveProjPrecision", ICON_FA_DRAW_POLYGON,
+                               g_settings.gpu_pgxp_preserve_proj_fp ?
+                                 TRANSLATE_STR("OSDMessage", "PGXP Preserve Projection Precision is now enabled.") :
+                                 TRANSLATE_STR("OSDMessage", "PGXP Preserve Projection Precision is now disabled."));
+     }
+   }},
+
+  {"ToggleVRAMView", TRANSLATE_NOOP("Hotkeys", "Debugging"), TRANSLATE_NOOP("Hotkeys", "Toggle VRAM View"),
+   [](InputButtonEvent event) {
+     if (event == InputButtonEvent::Pressed && System::IsValid())
+     {
+       if (!g_settings.gpu_pgxp_enable || Achievements::IsHardcoreModeActive())
+         return;
+
+       g_settings.gpu_show_vram = !g_settings.gpu_show_vram;
+       VideoThread::UpdateSettings(true, false, false);
+
+       Host::AddIconOSDMessage(OSDMessageType::Quick, "ToggleVRAMView", ICON_FA_FILE,
+                               g_settings.gpu_show_vram ? TRANSLATE_STR("OSDMessage", "Now showing VRAM.") :
+                                                          TRANSLATE_STR("OSDMessage", "Now showing display."));
+     }
+   }},
+
+#define MAKE_LOAD_STATE_HOTKEY(global, slot, name)                                                                     \
+  {global ? "LoadGameState" #slot : "LoadGlobalState" #slot, TRANSLATE_NOOP("Hotkeys", "Save States"), name,           \
+   [](InputButtonEvent event) {                                                                                        \
+     if (event == InputButtonEvent::Released)                                                                          \
+       Host::RunOnCoreThread([]() { System::LoadStateFromSlot(global, slot); });                                       \
+   }}
+#define MAKE_SAVE_STATE_HOTKEY(global, slot, name)                                                                     \
+  {global ? "SaveGameState" #slot : "SaveGlobalState" #slot, TRANSLATE_NOOP("Hotkeys", "Save States"), name,           \
+   [](InputButtonEvent event) {                                                                                        \
+     if (event == InputButtonEvent::Released)                                                                          \
+       Host::RunOnCoreThread([]() { System::SaveStateToSlot(global, slot); });                                         \
+   }}
+
+  MAKE_LOAD_STATE_HOTKEY(false, 1, TRANSLATE_NOOP("Hotkeys", "Load Game State 1")),
+  MAKE_SAVE_STATE_HOTKEY(false, 1, TRANSLATE_NOOP("Hotkeys", "Save Game State 1")),
+  MAKE_LOAD_STATE_HOTKEY(false, 2, TRANSLATE_NOOP("Hotkeys", "Load Game State 2")),
+  MAKE_SAVE_STATE_HOTKEY(false, 2, TRANSLATE_NOOP("Hotkeys", "Save Game State 2")),
+  MAKE_LOAD_STATE_HOTKEY(false, 3, TRANSLATE_NOOP("Hotkeys", "Load Game State 3")),
+  MAKE_SAVE_STATE_HOTKEY(false, 3, TRANSLATE_NOOP("Hotkeys", "Save Game State 3")),
+  MAKE_LOAD_STATE_HOTKEY(false, 4, TRANSLATE_NOOP("Hotkeys", "Load Game State 4")),
+  MAKE_SAVE_STATE_HOTKEY(false, 4, TRANSLATE_NOOP("Hotkeys", "Save Game State 4")),
+  MAKE_LOAD_STATE_HOTKEY(false, 5, TRANSLATE_NOOP("Hotkeys", "Load Game State 5")),
+  MAKE_SAVE_STATE_HOTKEY(false, 5, TRANSLATE_NOOP("Hotkeys", "Save Game State 5")),
+  MAKE_LOAD_STATE_HOTKEY(false, 6, TRANSLATE_NOOP("Hotkeys", "Load Game State 6")),
+  MAKE_SAVE_STATE_HOTKEY(false, 6, TRANSLATE_NOOP("Hotkeys", "Save Game State 6")),
+  MAKE_LOAD_STATE_HOTKEY(false, 7, TRANSLATE_NOOP("Hotkeys", "Load Game State 7")),
+  MAKE_SAVE_STATE_HOTKEY(false, 7, TRANSLATE_NOOP("Hotkeys", "Save Game State 7")),
+  MAKE_LOAD_STATE_HOTKEY(false, 8, TRANSLATE_NOOP("Hotkeys", "Load Game State 8")),
+  MAKE_SAVE_STATE_HOTKEY(false, 8, TRANSLATE_NOOP("Hotkeys", "Save Game State 8")),
+  MAKE_LOAD_STATE_HOTKEY(false, 9, TRANSLATE_NOOP("Hotkeys", "Load Game State 9")),
+  MAKE_SAVE_STATE_HOTKEY(false, 9, TRANSLATE_NOOP("Hotkeys", "Save Game State 9")),
+  MAKE_LOAD_STATE_HOTKEY(false, 10, TRANSLATE_NOOP("Hotkeys", "Load Game State 10")),
+  MAKE_SAVE_STATE_HOTKEY(false, 10, TRANSLATE_NOOP("Hotkeys", "Save Game State 10")),
+
+  MAKE_LOAD_STATE_HOTKEY(true, 1, TRANSLATE_NOOP("Hotkeys", "Load Global State 1")),
+  MAKE_SAVE_STATE_HOTKEY(true, 1, TRANSLATE_NOOP("Hotkeys", "Save Global State 1")),
+  MAKE_LOAD_STATE_HOTKEY(true, 2, TRANSLATE_NOOP("Hotkeys", "Load Global State 2")),
+  MAKE_SAVE_STATE_HOTKEY(true, 2, TRANSLATE_NOOP("Hotkeys", "Save Global State 2")),
+  MAKE_LOAD_STATE_HOTKEY(true, 3, TRANSLATE_NOOP("Hotkeys", "Load Global State 3")),
+  MAKE_SAVE_STATE_HOTKEY(true, 3, TRANSLATE_NOOP("Hotkeys", "Save Global State 3")),
+  MAKE_LOAD_STATE_HOTKEY(true, 4, TRANSLATE_NOOP("Hotkeys", "Load Global State 4")),
+  MAKE_SAVE_STATE_HOTKEY(true, 4, TRANSLATE_NOOP("Hotkeys", "Save Global State 4")),
+  MAKE_LOAD_STATE_HOTKEY(true, 5, TRANSLATE_NOOP("Hotkeys", "Load Global State 5")),
+  MAKE_SAVE_STATE_HOTKEY(true, 5, TRANSLATE_NOOP("Hotkeys", "Save Global State 5")),
+  MAKE_LOAD_STATE_HOTKEY(true, 6, TRANSLATE_NOOP("Hotkeys", "Load Global State 6")),
+  MAKE_SAVE_STATE_HOTKEY(true, 6, TRANSLATE_NOOP("Hotkeys", "Save Global State 6")),
+  MAKE_LOAD_STATE_HOTKEY(true, 7, TRANSLATE_NOOP("Hotkeys", "Load Global State 7")),
+  MAKE_SAVE_STATE_HOTKEY(true, 7, TRANSLATE_NOOP("Hotkeys", "Save Global State 7")),
+  MAKE_LOAD_STATE_HOTKEY(true, 8, TRANSLATE_NOOP("Hotkeys", "Load Global State 8")),
+  MAKE_SAVE_STATE_HOTKEY(true, 8, TRANSLATE_NOOP("Hotkeys", "Save Global State 8")),
+  MAKE_LOAD_STATE_HOTKEY(true, 9, TRANSLATE_NOOP("Hotkeys", "Load Global State 9")),
+  MAKE_SAVE_STATE_HOTKEY(true, 9, TRANSLATE_NOOP("Hotkeys", "Save Global State 9")),
+  MAKE_LOAD_STATE_HOTKEY(true, 10, TRANSLATE_NOOP("Hotkeys", "Load Global State 10")),
+  MAKE_SAVE_STATE_HOTKEY(true, 10, TRANSLATE_NOOP("Hotkeys", "Save Global State 10")),
+
+#undef MAKE_SAVE_STATE_HOTKEY
+#undef MAKE_LOAD_STATE_HOTKEY
+};
+
+std::span<const HotkeyInfo> Core::GetHotkeyList()
+{
+  return s_hotkey_list;
+}

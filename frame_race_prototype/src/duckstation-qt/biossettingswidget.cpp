@@ -1,0 +1,283 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "biossettingswidget.h"
+#include "qthost.h"
+#include "qtutils.h"
+#include "settingswindow.h"
+#include "settingwidgetbinder.h"
+
+#include "core/bios.h"
+#include "core/settings.h"
+
+#include "common/error.h"
+#include "common/file_system.h"
+#include "common/path.h"
+
+#include <QtCore/QDir>
+#include <QtWidgets/QFileDialog>
+#include <QtWidgets/QMessageBox>
+#include <algorithm>
+
+#include "moc_biossettingswidget.cpp"
+
+using namespace Qt::StringLiterals;
+
+BIOSSettingsWidget::BIOSSettingsWidget(SettingsWindow* dialog, QWidget* parent) : QWidget(parent), m_dialog(dialog)
+{
+  SettingsInterface* sif = dialog->getSettingsInterface();
+
+  m_ui.setupUi(this);
+
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableTTYLogging, Settings::BIOS_SECTION_NAME, "TTYLogging",
+                                               false);
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.pioDeviceType, Settings::PIO_SECTION_NAME, "DeviceType",
+                                               &Settings::ParsePIODeviceTypeName, &Settings::GetPIODeviceTypeModeName,
+                                               &Settings::GetPIODeviceTypeModeDisplayName,
+                                               Settings::DEFAULT_PIO_DEVICE_TYPE, PIODeviceType::MaxCount);
+  SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.pioImagePath, Settings::PIO_SECTION_NAME, "FlashImagePath");
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pioSwitchActive, Settings::PIO_SECTION_NAME, "SwitchActive",
+                                               true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pioImageWrites, Settings::PIO_SECTION_NAME,
+                                               "FlashImageWriteEnable", false);
+  connect(m_ui.pioDeviceType, &QComboBox::currentIndexChanged, this, &BIOSSettingsWidget::onPIODeviceTypeChanged);
+  connect(m_ui.pioImagePathBrowse, &QPushButton::clicked, this, &BIOSSettingsWidget::onPIOImagePathBrowseClicked);
+  onPIODeviceTypeChanged();
+
+  connect(m_ui.imageNTSCJ, &QComboBox::currentIndexChanged, [this](int index) {
+    if (m_dialog->isPerGameSettings() && index == 0)
+    {
+      m_dialog->removeSettingValue(Settings::BIOS_SECTION_NAME, "PathNTSCJ");
+    }
+    else
+    {
+      m_dialog->setStringSettingValue(Settings::BIOS_SECTION_NAME, "PathNTSCJ",
+                                      m_ui.imageNTSCJ->itemData(index).toString().toStdString().c_str());
+    }
+  });
+  connect(m_ui.imageNTSCU, &QComboBox::currentIndexChanged, [this](int index) {
+    if (m_dialog->isPerGameSettings() && index == 0)
+    {
+      m_dialog->removeSettingValue(Settings::BIOS_SECTION_NAME, "PathNTSCU");
+    }
+    else
+    {
+      m_dialog->setStringSettingValue(Settings::BIOS_SECTION_NAME, "PathNTSCU",
+                                      m_ui.imageNTSCU->itemData(index).toString().toStdString().c_str());
+    }
+  });
+  connect(m_ui.imagePAL, &QComboBox::currentIndexChanged, [this](int index) {
+    if (m_dialog->isPerGameSettings() && index == 0)
+    {
+      m_dialog->removeSettingValue(Settings::BIOS_SECTION_NAME, "PathPAL");
+    }
+    else
+    {
+      m_dialog->setStringSettingValue(Settings::BIOS_SECTION_NAME, "PathPAL",
+                                      m_ui.imagePAL->itemData(index).toString().toStdString().c_str());
+    }
+  });
+
+  connect(m_ui.install, &QPushButton::clicked, this, [this]() {
+    if (installBIOS(this))
+      refreshList();
+  });
+  connect(m_ui.rescan, &QPushButton::clicked, this, &BIOSSettingsWidget::refreshList);
+
+  if (!m_dialog->isPerGameSettings())
+  {
+    SettingWidgetBinder::BindWidgetToFolderSetting(sif, m_ui.searchDirectory, m_ui.browseSearchDirectory,
+                                                   tr("Select BIOS Directory"), m_ui.searchDirectoryOpen,
+                                                   m_ui.searchDirectoryReset, Settings::BIOS_SECTION_NAME,
+                                                   "SearchDirectory", Path::Combine(EmuFolders::DataRoot, "bios"));
+    connect(m_ui.searchDirectory, &QLineEdit::textChanged, this, &BIOSSettingsWidget::refreshList);
+  }
+  else
+  {
+    m_ui.mainLayout->removeWidget(m_ui.directoryGroupBox);
+    delete m_ui.directoryGroupBox;
+    m_ui.rescan = nullptr;
+    m_ui.install = nullptr;
+    m_ui.directoryGroupBox = nullptr;
+    m_ui.directoryGroupBoxLabel = nullptr;
+    m_ui.directoryGroupBoxLayout = nullptr;
+    m_ui.directoryGroupBoxHorizontalLayout = nullptr;
+    m_ui.searchDirectory = nullptr;
+    m_ui.browseSearchDirectory = nullptr;
+  }
+
+  refreshList();
+
+  dialog->registerWidgetHelp(m_ui.rescan, tr("Refresh List"), QString(),
+                             tr("Refreshes the list of BIOS images that can be selected."));
+  dialog->registerWidgetHelp(m_ui.install, tr("Install BIOS"), QString(),
+                             tr("Installs a new BIOS image into the emulator's BIOS directory."));
+
+  dialog->registerWidgetHelp(m_ui.pioDeviceType, tr("Device Type"), tr("None"),
+                             tr("Simulates a device plugged into the console's parallel port. Usually these are flash "
+                                "cartridges, and require some sort of image dump to function."));
+  dialog->registerWidgetHelp(m_ui.pioImagePath, tr("Image Path"), tr("Empty"),
+                             tr("Sets the path to the image used for flash cartridges."));
+  dialog->registerWidgetHelp(m_ui.pioSwitchActive, tr("Cartridge Switch On"), tr("Checked"),
+                             tr("Simulates the position of the switch on the cartridge. Most cartridges require the "
+                                "switch to be on for it to activate on startup."));
+  dialog->registerWidgetHelp(
+    m_ui.pioImageWrites, tr("Allow Image Writes"), tr("Unchecked"),
+    tr("Stores any images made to the cartridge's flash storage back to the host's file system. <strong>This will "
+       "overwrite your cartridge dump,</strong> you should ensure you have a backup first."));
+  dialog->registerWidgetHelp(m_ui.enableTTYLogging, tr("Enable TTY Logging"), tr("Unchecked"),
+                             tr("Logs BIOS calls to printf(). Not all games contain debugging messages."));
+}
+
+BIOSSettingsWidget::~BIOSSettingsWidget() = default;
+
+bool BIOSSettingsWidget::installBIOS(QWidget* parent)
+{
+  const QString source_path = QDir::toNativeSeparators(QFileDialog::getOpenFileName(parent, tr("Select BIOS Image")));
+  if (source_path.isEmpty())
+    return false;
+
+  const std::string source_path_str(source_path.toStdString());
+  Error error;
+  const std::optional<BIOS::Image> image = BIOS::LoadImageFromFile(source_path_str.c_str(), &error);
+  if (!image.has_value())
+  {
+    QtUtils::AsyncMessageBox(parent, QMessageBox::Critical, tr("BIOS Install Error"),
+                             QString::fromStdString(error.GetDescription()));
+    return false;
+  }
+
+  const std::string_view source_filename = Path::GetFileName(source_path_str);
+  const std::string_view destination_filename =
+    (image->info && image->info->expected_filename) ? image->info->expected_filename : source_filename;
+  const std::string destination_path = Path::Combine(EmuFolders::Bios, destination_filename);
+
+  bool replace = false;
+  if (FileSystem::FileExists(destination_path.c_str()))
+  {
+    if (QtUtils::MessageBoxQuestion(
+          parent, tr("BIOS Already Installed"),
+          tr("The BIOS file '%1' is already installed. Do you want to overwrite it?")
+            .arg(QString::fromUtf8(destination_filename.data(), static_cast<qsizetype>(destination_filename.size()))),
+          QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+    {
+      return false;
+    }
+
+    replace = true;
+  }
+
+  if (!FileSystem::CopyFilePath(source_path_str.c_str(), destination_path.c_str(), replace, &error))
+  {
+    QtUtils::AsyncMessageBox(parent, QMessageBox::Critical, tr("BIOS Install Error"),
+                             QString::fromStdString(error.GetDescription()));
+    return false;
+  }
+
+  QMessageBox::information(
+    parent, tr("BIOS Installed"),
+    tr("BIOS '%1' installed as '%2'.")
+      .arg(image->info ? QString::fromUtf8(image->info->description) : tr("Unknown"),
+           QString::fromUtf8(destination_filename.data(), static_cast<qsizetype>(destination_filename.size()))));
+  return true;
+}
+
+void BIOSSettingsWidget::refreshList()
+{
+  auto images = BIOS::FindBIOSImagesInDirectory(EmuFolders::Bios.c_str());
+  populateDropDownForRegion(ConsoleRegion::NTSC_J, m_ui.imageNTSCJ, images, m_dialog->isPerGameSettings());
+  populateDropDownForRegion(ConsoleRegion::NTSC_U, m_ui.imageNTSCU, images, m_dialog->isPerGameSettings());
+  populateDropDownForRegion(ConsoleRegion::PAL, m_ui.imagePAL, images, m_dialog->isPerGameSettings());
+
+  setDropDownValue(m_ui.imageNTSCJ, m_dialog->getStringValue(Settings::BIOS_SECTION_NAME, "PathNTSCJ", std::nullopt),
+                   m_dialog->isPerGameSettings());
+  setDropDownValue(m_ui.imageNTSCU, m_dialog->getStringValue(Settings::BIOS_SECTION_NAME, "PathNTSCU", std::nullopt),
+                   m_dialog->isPerGameSettings());
+  setDropDownValue(m_ui.imagePAL, m_dialog->getStringValue(Settings::BIOS_SECTION_NAME, "PathPAL", std::nullopt),
+                   m_dialog->isPerGameSettings());
+}
+
+void BIOSSettingsWidget::populateDropDownForRegion(ConsoleRegion region, QComboBox* cb,
+                                                   std::vector<std::pair<std::string, const BIOS::ImageInfo*>>& images,
+                                                   bool per_game)
+{
+  QSignalBlocker sb(cb);
+  cb->clear();
+
+  if (per_game)
+    cb->addItem(QIcon(u":/icons/system-search.png"_s), tr("Use Global Setting"));
+
+  cb->addItem(QIcon(u":/icons/system-search.png"_s), tr("Auto-Detect"));
+
+  std::sort(images.begin(), images.end(), [region](const auto& left, const auto& right) {
+    const bool left_region_match = (left.second && left.second->region == region);
+    const bool right_region_match = (right.second && right.second->region == region);
+    if (left_region_match && !right_region_match)
+      return true;
+    else if (right_region_match && !left_region_match)
+      return false;
+
+    return left.first < right.first;
+  });
+
+  for (const auto& [name, info] : images)
+  {
+    QString name_str(QString::fromStdString(name));
+    cb->addItem(QtUtils::GetIconForRegion(info ? info->region : ConsoleRegion::Count),
+                QStringLiteral("%1 (%2)").arg(info ? QString(info->description) : tr("Unknown")).arg(name_str),
+                QVariant(name_str));
+  }
+}
+
+void BIOSSettingsWidget::setDropDownValue(QComboBox* cb, const std::optional<std::string>& name, bool per_game)
+{
+  QSignalBlocker sb(cb);
+
+  if (!name.has_value() || name->empty())
+  {
+    cb->setCurrentIndex((per_game && name.has_value()) ? 1 : 0);
+    return;
+  }
+
+  QString qname(QString::fromStdString(name.value()));
+  for (int i = 1; i < cb->count(); i++)
+  {
+    if (cb->itemData(i) == qname)
+    {
+      cb->setCurrentIndex(i);
+      return;
+    }
+  }
+
+  cb->addItem(QIcon(u":/icons/monochrome/svg/close-line.png"_s), tr("%1 (Missing)").arg(qname), QVariant(qname));
+  cb->setCurrentIndex(cb->count() - 1);
+}
+
+void BIOSSettingsWidget::onPIODeviceTypeChanged()
+{
+  const PIODeviceType type =
+    Settings::ParsePIODeviceTypeName(
+      m_dialog
+        ->getEffectiveStringValue(Settings::PIO_SECTION_NAME, "DeviceType",
+                                  Settings::GetPIODeviceTypeModeName(Settings::DEFAULT_PIO_DEVICE_TYPE))
+        .c_str())
+      .value_or(Settings::DEFAULT_PIO_DEVICE_TYPE);
+  const bool has_image = (type == PIODeviceType::XplorerCart);
+  const bool has_switch = (type == PIODeviceType::XplorerCart);
+  m_ui.pioImagePathLabel->setEnabled(has_image);
+  m_ui.pioImagePath->setEnabled(has_image);
+  m_ui.pioImagePathBrowse->setEnabled(has_image);
+  m_ui.pioImageWrites->setEnabled(has_image);
+  m_ui.pioSwitchActive->setEnabled(has_switch);
+}
+
+void BIOSSettingsWidget::onPIOImagePathBrowseClicked()
+{
+  const QString path =
+    QDir::toNativeSeparators(QFileDialog::getOpenFileName(this, tr("Select PIO Image"), m_ui.pioImagePath->text()));
+  if (path.isEmpty())
+    return;
+
+  m_ui.pioImagePath->setText(path);
+}

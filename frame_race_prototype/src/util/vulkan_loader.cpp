@@ -1,0 +1,772 @@
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+// No better place for this..
+#define VMA_IMPLEMENTATION
+
+#include "vulkan_loader.h"
+#include "vulkan_builders.h"
+#include "vulkan_device.h"
+
+#include "core/settings.h"
+
+#include "common/assert.h"
+#include "common/dynamic_library.h"
+#include "common/error.h"
+#include "common/log.h"
+#include "common/threading.h"
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+LOG_CHANNEL(GPUDevice);
+
+extern "C" {
+
+#define VULKAN_MODULE_ENTRY_POINT(name, required) PFN_##name name;
+#define VULKAN_INSTANCE_ENTRY_POINT(name, required) PFN_##name name;
+#define VULKAN_DEVICE_ENTRY_POINT(name, required) PFN_##name name;
+#include "vulkan_entry_points.inl"
+#undef VULKAN_DEVICE_ENTRY_POINT
+#undef VULKAN_INSTANCE_ENTRY_POINT
+#undef VULKAN_MODULE_ENTRY_POINT
+}
+
+namespace VulkanLoader {
+
+static bool LoadVulkanLibrary(WindowInfoType wtype, Error* error);
+static bool LoadInstanceFunctions(VkInstance instance, Error* error);
+static void UnloadVulkanLibrary();
+
+static bool LockedCreateVulkanInstance(WindowInfoType wtype, bool* request_debug_instance, bool gpu_validation,
+                                       Error* error);
+static void LockedReleaseVulkanInstance();
+static void LockedDestroyVulkanInstance();
+
+static bool SelectInstanceExtensions(VulkanDevice::ExtensionList* extension_list, WindowInfoType wtype,
+                                     bool debug_instance, bool gpu_validation, Error* error);
+
+VKAPI_ATTR static VkBool32 VKAPI_CALL DebugMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                             VkDebugUtilsMessageTypeFlagsEXT messageType,
+                                                             const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+                                                             void* pUserData);
+
+namespace {
+struct Locals
+{
+  DynamicLibrary library;
+  VkInstance instance = VK_NULL_HANDLE;
+  VkDebugUtilsMessengerEXT debug_messenger_callback = VK_NULL_HANDLE;
+  u32 reference_count = 0;
+  OptionalExtensions optional_extensions{};
+  WindowInfoType window_type = WindowInfoType::Surfaceless;
+  bool is_debug_instance = false;
+  bool is_gpu_validation_instance = false;
+
+  Threading::Mutex mutex;
+};
+
+static const DynamicLibrary::OptionalSymbolTable s_vulkan_module_entry_points[] = {
+#define VULKAN_MODULE_ENTRY_POINT(name, required) {#name, reinterpret_cast<void**>(&name), required},
+#include "vulkan_entry_points.inl"
+#undef VULKAN_MODULE_ENTRY_POINT
+};
+
+static const DynamicLibrary::OptionalSymbolTable s_vulkan_instance_entry_points[] = {
+#define VULKAN_INSTANCE_ENTRY_POINT(name, required) {#name, reinterpret_cast<void**>(&name), required},
+#include "vulkan_entry_points.inl"
+#undef VULKAN_INSTANCE_ENTRY_POINT
+};
+
+static const DynamicLibrary::OptionalSymbolTable s_vulkan_device_entry_points[] = {
+#define VULKAN_DEVICE_ENTRY_POINT(name, required) {#name, reinterpret_cast<void**>(&name), required},
+#include "vulkan_entry_points.inl"
+#undef VULKAN_DEVICE_ENTRY_POINT
+};
+
+} // namespace
+
+ALIGN_TO_CACHE_LINE static Locals s_locals;
+
+} // namespace VulkanLoader
+
+bool VulkanLoader::LoadVulkanLibrary(WindowInfoType wtype, Error* error)
+{
+  if (s_locals.library.IsOpen())
+    return true;
+
+#ifdef __APPLE__
+  // Check if a path to a specific Vulkan library has been specified.
+  char* libvulkan_env = getenv("LIBVULKAN_PATH");
+  if (libvulkan_env)
+    s_locals.library.Open(libvulkan_env, error);
+  if (!s_locals.library.IsOpen() &&
+      !s_locals.library.Open(DynamicLibrary::GetVersionedFilename("MoltenVK").c_str(), error))
+  {
+    return false;
+  }
+#else
+  // try versioned first, then unversioned.
+  if (!s_locals.library.Open(DynamicLibrary::GetVersionedFilename("vulkan", 1).c_str(), error) &&
+      !s_locals.library.Open(DynamicLibrary::GetVersionedFilename("vulkan").c_str(), error))
+  {
+    return false;
+  }
+#endif
+
+  if (!s_locals.library.ResolveSymbols(s_vulkan_module_entry_points, error))
+  {
+    DynamicLibrary::ClearSymbols(s_vulkan_module_entry_points);
+    s_locals.library.Close();
+    return false;
+  }
+
+  return true;
+}
+
+void VulkanLoader::UnloadVulkanLibrary()
+{
+  DynamicLibrary::ClearSymbols(s_vulkan_module_entry_points);
+  s_locals.library.Close();
+}
+
+bool VulkanLoader::LoadInstanceFunctions(VkInstance instance, Error* error)
+{
+  for (const DynamicLibrary::OptionalSymbolTable& entry : s_vulkan_instance_entry_points)
+  {
+    if (!(*entry.ptr = reinterpret_cast<void*>(vkGetInstanceProcAddr(instance, entry.name))) && entry.required)
+    {
+      Error::SetStringFmt(error, "Failed to load required instance function {}", entry.name);
+      DynamicLibrary::ClearSymbols(s_vulkan_instance_entry_points);
+      return false;
+    }
+  }
+
+  // we might not have VK_KHR_get_physical_device_properties2...
+  if (!vkGetPhysicalDeviceFeatures2 || !vkGetPhysicalDeviceProperties2 || !vkGetPhysicalDeviceMemoryProperties2)
+  {
+    if (!vkGetPhysicalDeviceFeatures2KHR || !vkGetPhysicalDeviceProperties2KHR ||
+        !vkGetPhysicalDeviceMemoryProperties2KHR)
+    {
+      ERROR_LOG("One or more functions from VK_KHR_get_physical_device_properties2 is missing, disabling extension.");
+      s_locals.optional_extensions.vk_khr_get_physical_device_properties2 = false;
+      vkGetPhysicalDeviceFeatures2 = nullptr;
+      vkGetPhysicalDeviceProperties2 = nullptr;
+      vkGetPhysicalDeviceMemoryProperties2 = nullptr;
+    }
+    else
+    {
+      vkGetPhysicalDeviceFeatures2 = vkGetPhysicalDeviceFeatures2KHR;
+      vkGetPhysicalDeviceProperties2 = vkGetPhysicalDeviceProperties2KHR;
+      vkGetPhysicalDeviceMemoryProperties2 = vkGetPhysicalDeviceMemoryProperties2KHR;
+    }
+  }
+
+  return true;
+}
+
+bool VulkanLoader::LoadDeviceFunctions(VkDevice device, Error* error)
+{
+  for (const DynamicLibrary::OptionalSymbolTable& entry : s_vulkan_device_entry_points)
+  {
+    if (!(*entry.ptr = reinterpret_cast<void*>(vkGetDeviceProcAddr(device, entry.name))) && entry.required)
+    {
+      Error::SetStringFmt(error, "Failed to load required device function {}", entry.name);
+      DynamicLibrary::ClearSymbols(s_vulkan_device_entry_points);
+      return false;
+    }
+  }
+
+  // Alias for swapchain maintenance.
+  if (!vkReleaseSwapchainImagesKHR)
+    vkReleaseSwapchainImagesKHR = vkReleaseSwapchainImagesEXT;
+
+  return true;
+}
+
+void VulkanLoader::ResetDeviceFunctions()
+{
+  DynamicLibrary::ClearSymbols(s_vulkan_device_entry_points);
+}
+
+bool VulkanLoader::LockedCreateVulkanInstance(WindowInfoType wtype, bool* request_debug_instance, bool gpu_validation,
+                                              Error* error)
+{
+  if (s_locals.instance != VK_NULL_HANDLE &&
+      ((request_debug_instance &&
+        (*request_debug_instance != s_locals.is_debug_instance ||
+         (*request_debug_instance && gpu_validation != s_locals.is_gpu_validation_instance))) ||
+       s_locals.window_type != wtype))
+  {
+    // Different debug setting, need to recreate the instance.
+    if (s_locals.reference_count > 0)
+      ERROR_LOG("Cannot change Vulkan instance window type/debug setting while in use.");
+    else
+      LockedDestroyVulkanInstance();
+  }
+
+  if (s_locals.instance != VK_NULL_HANDLE)
+  {
+    s_locals.reference_count++;
+    DEV_LOG("Using cached Vulkan instance, reference count {}", s_locals.reference_count);
+    return s_locals.instance;
+  }
+
+  if (!LoadVulkanLibrary(wtype, error))
+    return false;
+
+  bool debug_instance = request_debug_instance ? *request_debug_instance : g_settings.gpu_use_debug_device;
+  INFO_LOG("Creating new Vulkan instance (debug {}, wtype {})...", debug_instance, static_cast<u32>(wtype));
+
+  gpu_validation = (debug_instance && gpu_validation);
+
+  VulkanDevice::ExtensionList enabled_extensions;
+  if (!SelectInstanceExtensions(&enabled_extensions, wtype, debug_instance, gpu_validation, error))
+    return false;
+
+  u32 maxApiVersion = VK_API_VERSION_1_0;
+  if (vkEnumerateInstanceVersion)
+  {
+    VkResult res = vkEnumerateInstanceVersion(&maxApiVersion);
+    if (res != VK_SUCCESS)
+    {
+      LOG_VULKAN_ERROR(res, "vkEnumerateInstanceVersion() failed: ");
+      maxApiVersion = VK_API_VERSION_1_0;
+    }
+  }
+  else
+  {
+    WARNING_LOG("Driver does not provide vkEnumerateInstanceVersion().");
+  }
+
+  // Cap out at 1.1 for consistency.
+  const u32 apiVersion = std::min(maxApiVersion, VK_API_VERSION_1_1);
+  INFO_LOG("Supported instance version: {}.{}.{}, requesting version {}.{}.{}", VK_API_VERSION_MAJOR(maxApiVersion),
+           VK_API_VERSION_MINOR(maxApiVersion), VK_API_VERSION_PATCH(maxApiVersion), VK_API_VERSION_MAJOR(apiVersion),
+           VK_API_VERSION_MINOR(apiVersion), VK_API_VERSION_PATCH(apiVersion));
+
+  // Remember to manually update this every release. We don't pull in svnrev.h here, because
+  // it's only the major/minor version, and rebuilding the file every time something else changes
+  // is unnecessary.
+  VkApplicationInfo app_info = {};
+  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app_info.pNext = nullptr;
+  app_info.pApplicationName = "DuckStation";
+  app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
+  app_info.pEngineName = "DuckStation";
+  app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
+  app_info.apiVersion = apiVersion;
+
+  VkInstanceCreateInfo instance_create_info = {};
+  instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  instance_create_info.pNext = nullptr;
+  instance_create_info.flags = 0;
+  instance_create_info.pApplicationInfo = &app_info;
+  instance_create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+  instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  instance_create_info.enabledLayerCount = 0;
+  instance_create_info.ppEnabledLayerNames = nullptr;
+
+  // GPU-assisted and synchronization validation are enabled through the validation layer's settings.
+  static constexpr VkBool32 layer_setting_enabled = VK_TRUE;
+  static constexpr VkLayerSettingEXT gpu_validation_layer_settings[] = {
+    {"VK_LAYER_KHRONOS_validation", "gpuav_enable", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &layer_setting_enabled},
+    {"VK_LAYER_KHRONOS_validation", "validate_sync", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &layer_setting_enabled},
+  };
+  const VkLayerSettingsCreateInfoEXT layer_settings_info = {VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT, nullptr,
+                                                            static_cast<u32>(std::size(gpu_validation_layer_settings)),
+                                                            gpu_validation_layer_settings};
+
+  // Enable debug layer on debug builds
+  if (debug_instance)
+  {
+    static const char* layer_names[] = {"VK_LAYER_KHRONOS_validation"};
+    instance_create_info.enabledLayerCount = 1;
+    instance_create_info.ppEnabledLayerNames = layer_names;
+    if (gpu_validation)
+      instance_create_info.pNext = &layer_settings_info;
+  }
+
+  DebugAssert(s_locals.instance == VK_NULL_HANDLE && s_locals.reference_count == 0);
+  VkResult res = vkCreateInstance(&instance_create_info, nullptr, &s_locals.instance);
+  if (res != VK_SUCCESS)
+  {
+    // If creation failed, try without the debug flag.
+    if (debug_instance)
+    {
+      LOG_VULKAN_ERROR(res, "vkCreateInstance() failed, trying without debug layers: ");
+      debug_instance = false;
+      gpu_validation = false;
+      if (SelectInstanceExtensions(&enabled_extensions, wtype, false, false, error))
+      {
+        instance_create_info.pNext = nullptr;
+        instance_create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+        instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+        instance_create_info.enabledLayerCount = 0;
+        instance_create_info.ppEnabledLayerNames = nullptr;
+        res = vkCreateInstance(&instance_create_info, nullptr, &s_locals.instance);
+      }
+    }
+
+    if (res != VK_SUCCESS)
+    {
+      Vulkan::SetErrorObject(error, "vkCreateInstance() failed: ", res);
+      return false;
+    }
+  }
+
+  if (!LoadInstanceFunctions(s_locals.instance, error))
+  {
+    LockedDestroyVulkanInstance();
+    return false;
+  }
+
+  DEV_LOG("Created new Vulkan instance.");
+  s_locals.reference_count = 1;
+  s_locals.window_type = wtype;
+  s_locals.is_debug_instance = debug_instance;
+  s_locals.is_gpu_validation_instance = gpu_validation;
+  if (request_debug_instance)
+    *request_debug_instance = debug_instance;
+
+  // Check for presence of the functions before calling
+  if (debug_instance)
+  {
+    if (vkCreateDebugUtilsMessengerEXT && vkDestroyDebugUtilsMessengerEXT && vkSubmitDebugUtilsMessageEXT)
+    {
+      const VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
+        VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        nullptr,
+        0,
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
+        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT |
+          VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+        DebugMessengerCallback,
+        nullptr};
+
+      res =
+        vkCreateDebugUtilsMessengerEXT(s_locals.instance, &messenger_info, nullptr, &s_locals.debug_messenger_callback);
+      if (res != VK_SUCCESS)
+        LOG_VULKAN_ERROR(res, "vkCreateDebugUtilsMessengerEXT failed: ");
+    }
+    else
+    {
+      WARNING_LOG("Vulkan: Debug messenger requested, but functions are not available.");
+    }
+  }
+
+  return true;
+}
+
+bool VulkanLoader::SelectInstanceExtensions(VulkanDevice::ExtensionList* extension_list, WindowInfoType wtype,
+                                            bool debug_instance, bool gpu_validation, Error* error)
+{
+  u32 extension_count = 0;
+  VkResult res = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
+  if (res != VK_SUCCESS)
+  {
+    LOG_VULKAN_ERROR(res, "vkEnumerateInstanceExtensionProperties failed: ");
+    return false;
+  }
+
+  if (extension_count == 0)
+  {
+    ERROR_LOG("Vulkan: No extensions supported by instance.");
+    return false;
+  }
+
+  std::vector<VkExtensionProperties> available_extension_list(extension_count);
+  res = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_extension_list.data());
+  DebugAssert(res == VK_SUCCESS);
+
+  // VK_EXT_layer_settings is provided by the validation layer, so it isn't in the implementation's list.
+  u32 layer_extension_count = 0;
+  if (gpu_validation && vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layer_extension_count,
+                                                               nullptr) == VK_SUCCESS)
+  {
+    available_extension_list.resize(extension_count + layer_extension_count);
+    vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &layer_extension_count,
+                                           &available_extension_list[extension_count]);
+    available_extension_list.resize(extension_count + layer_extension_count);
+  }
+
+  const auto SupportsExtension = [&available_extension_list, &extension_list](const char* name, bool required) {
+    if (std::find_if(available_extension_list.begin(), available_extension_list.end(),
+                     [&](const VkExtensionProperties& properties) {
+                       return (std::strcmp(name, properties.extensionName) == 0);
+                     }) != available_extension_list.end())
+    {
+      DEV_LOG("Enabling extension: {}", name);
+      extension_list->push_back(name);
+      return true;
+    }
+
+    if (required)
+      ERROR_LOG("Vulkan: Missing required extension {}.", name);
+
+    return false;
+  };
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+  if (wtype == WindowInfoType::Win32 && (!SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true) ||
+                                         !SupportsExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true)))
+  {
+    return false;
+  }
+#endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+  if (wtype == WindowInfoType::XCB && (!SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true) ||
+                                       !SupportsExtension(VK_KHR_XCB_SURFACE_EXTENSION_NAME, true)))
+  {
+    return false;
+  }
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (wtype == WindowInfoType::Wayland && (!SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true) ||
+                                           !SupportsExtension(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, true)))
+  {
+    return false;
+  }
+#endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+  if (wtype == WindowInfoType::MacOS && (!SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true) ||
+                                         !SupportsExtension(VK_EXT_METAL_SURFACE_EXTENSION_NAME, true)))
+  {
+    return false;
+  }
+#endif
+
+  // VK_EXT_debug_utils
+  if (debug_instance && !SupportsExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false))
+    WARNING_LOG("Vulkan: Debug report requested, but extension is not available.");
+
+  // VK_EXT_layer_settings
+  if (gpu_validation && !SupportsExtension(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME, false))
+    WARNING_LOG("Vulkan: GPU validation requested, but layer settings extension is not available.");
+
+  s_locals.optional_extensions.vk_khr_get_surface_capabilities2 =
+    (wtype != WindowInfoType::Surfaceless &&
+     SupportsExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, false));
+  s_locals.optional_extensions.vk_khr_surface_maintenance1 =
+    (wtype != WindowInfoType::Surfaceless && (SupportsExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME, false) ||
+                                              SupportsExtension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME, false)));
+  s_locals.optional_extensions.vk_khr_get_physical_device_properties2 =
+    SupportsExtension(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, false);
+
+#define LOG_EXT(name, field)                                                                                           \
+  GENERIC_LOG(___LogChannel___, Log::Level::Info,                                                                      \
+              s_locals.optional_extensions.field ? Log::Color::StrongGreen : Log::Color::StrongOrange, name " is {}",  \
+              s_locals.optional_extensions.field ? "supported" : "NOT supported")
+
+  LOG_EXT("VK_KHR_get_physical_device_properties2", vk_khr_get_physical_device_properties2);
+  LOG_EXT("VK_KHR_get_surface_capabilities2", vk_khr_get_surface_capabilities2);
+  LOG_EXT("VK_KHR_surface_maintenance1", vk_khr_surface_maintenance1);
+
+#undef LOG_EXT
+
+  return true;
+}
+
+void VulkanLoader::LockedReleaseVulkanInstance()
+{
+  Assert(s_locals.reference_count > 0);
+  s_locals.reference_count--;
+
+  // We specifically keep the instance around even after releasing it.
+  // Both AMD on Windows and Mesa leak a few tens of megabytes for every instance...
+  DEV_LOG("Released Vulkan instance, reference count {}", s_locals.reference_count);
+}
+
+void VulkanLoader::LockedDestroyVulkanInstance()
+{
+  DebugAssert(s_locals.reference_count == 0);
+  DebugAssert(s_locals.instance != VK_NULL_HANDLE);
+
+  if (s_locals.debug_messenger_callback != VK_NULL_HANDLE)
+  {
+    vkDestroyDebugUtilsMessengerEXT(s_locals.instance, s_locals.debug_messenger_callback, nullptr);
+    s_locals.debug_messenger_callback = VK_NULL_HANDLE;
+  }
+
+  if (vkDestroyInstance)
+    vkDestroyInstance(s_locals.instance, nullptr);
+  else
+    ERROR_LOG("Vulkan instance was leaked because vkDestroyInstance() could not be loaded.");
+
+  s_locals.optional_extensions = {};
+  s_locals.instance = VK_NULL_HANDLE;
+  DynamicLibrary::ClearSymbols(s_vulkan_instance_entry_points);
+}
+
+bool VulkanLoader::CreateVulkanInstance(WindowInfoType window_type, bool* request_debug_instance, bool gpu_validation,
+                                        Error* error)
+{
+  const std::lock_guard lock(s_locals.mutex);
+  return LockedCreateVulkanInstance(window_type, request_debug_instance, gpu_validation, error);
+}
+
+VkInstance VulkanLoader::GetVulkanInstance()
+{
+  // Doesn't need to be locked, but should have an instance.
+  DebugAssert(s_locals.instance != VK_NULL_HANDLE);
+  return s_locals.instance;
+}
+
+void VulkanLoader::ReleaseVulkanInstance()
+{
+  const std::lock_guard lock(s_locals.mutex);
+  LockedReleaseVulkanInstance();
+}
+
+void VulkanLoader::DestroyVulkanInstance()
+{
+  const std::lock_guard lock(s_locals.mutex);
+  if (s_locals.instance != VK_NULL_HANDLE)
+    LockedDestroyVulkanInstance();
+  UnloadVulkanLibrary();
+}
+
+const VulkanLoader::OptionalExtensions& VulkanLoader::GetOptionalExtensions()
+{
+  return s_locals.optional_extensions;
+}
+
+VulkanLoader::GPUList VulkanLoader::EnumerateGPUs(Error* error)
+{
+  GPUList gpus;
+
+  u32 gpu_count = 0;
+  VkResult res = vkEnumeratePhysicalDevices(s_locals.instance, &gpu_count, nullptr);
+  if ((res != VK_SUCCESS && res != VK_INCOMPLETE) || gpu_count == 0)
+  {
+    Vulkan::SetErrorObject(error, "vkEnumeratePhysicalDevices (1) failed: ", res);
+    return gpus;
+  }
+
+  std::vector<VkPhysicalDevice> physical_devices(gpu_count);
+  res = vkEnumeratePhysicalDevices(s_locals.instance, &gpu_count, physical_devices.data());
+  if (res == VK_INCOMPLETE)
+  {
+    WARNING_LOG("First vkEnumeratePhysicalDevices() call returned {} devices, but second returned {}",
+                physical_devices.size(), gpu_count);
+  }
+  else if (res != VK_SUCCESS)
+  {
+    Vulkan::SetErrorObject(error, "vkEnumeratePhysicalDevices (2) failed: ", res);
+    return gpus;
+  }
+
+  if (gpu_count == 0)
+  {
+    Error::SetStringView(error, "No Vulkan physical devices available.");
+    return gpus;
+  }
+
+  // Maybe we lost a GPU?
+  if (gpu_count < physical_devices.size())
+    physical_devices.resize(gpu_count);
+
+  gpus.reserve(physical_devices.size());
+  for (VkPhysicalDevice device : physical_devices)
+  {
+    VkPhysicalDeviceProperties2 props = {};
+    VkPhysicalDeviceDriverProperties driver_props = {};
+
+    if (vkGetPhysicalDeviceProperties2)
+    {
+      props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+      Vulkan::AddPointerToChain(&props, &driver_props);
+      vkGetPhysicalDeviceProperties2(device, &props);
+    }
+
+    // just in case the chained version fails
+    vkGetPhysicalDeviceProperties(device, &props.properties);
+
+    VkPhysicalDeviceFeatures available_features = {};
+    vkGetPhysicalDeviceFeatures(device, &available_features);
+
+    GPUDevice::AdapterInfo ai;
+    ai.name = props.properties.deviceName;
+    ai.max_texture_size =
+      std::min(props.properties.limits.maxFramebufferWidth, props.properties.limits.maxImageDimension2D);
+    ai.max_multisamples = Vulkan::GetMaxMultisamples(device, props.properties);
+    ai.driver_type = GuessDriverType(props.properties, driver_props);
+    ai.supports_sample_shading = available_features.sampleRateShading;
+
+    // handle duplicate adapter names
+    if (std::any_of(gpus.begin(), gpus.end(), [&ai](const auto& other) { return (ai.name == other.second.name); }))
+    {
+      std::string original_adapter_name = std::move(ai.name);
+
+      u32 current_extra = 2;
+      do
+      {
+        ai.name = fmt::format("{} ({})", original_adapter_name, current_extra);
+        current_extra++;
+      } while (
+        std::any_of(gpus.begin(), gpus.end(), [&ai](const auto& other) { return (ai.name == other.second.name); }));
+    }
+
+    gpus.emplace_back(device, std::move(ai));
+  }
+
+  return gpus;
+}
+
+bool VulkanLoader::IsSuitableDefaultRenderer(WindowInfoType window_type)
+{
+  const std::optional<GPUDevice::AdapterInfoList> adapter_list = GetAdapterList(window_type, nullptr);
+  if (!adapter_list.has_value() || adapter_list->empty())
+  {
+    // No adapters, not gonna be able to use VK.
+    return false;
+  }
+
+  // Check the first GPU, should be enough.
+  const GPUDevice::AdapterInfo& ainfo = adapter_list->front();
+  INFO_LOG("Using Vulkan GPU '{}' for automatic renderer check.", ainfo.name);
+
+  // Any software rendering (LLVMpipe, SwiftShader).
+  if ((static_cast<u16>(ainfo.driver_type) & static_cast<u16>(GPUDriverType::SoftwareFlag)) ==
+      static_cast<u32>(GPUDriverType::SoftwareFlag))
+  {
+    INFO_LOG("Not using Vulkan for software renderer.");
+    return false;
+  }
+
+#ifdef __linux__
+  // Intel Ivy Bridge/Haswell/Broadwell drivers are incomplete.
+  if (ainfo.driver_type == GPUDriverType::IntelMesa &&
+      (ainfo.name.find("Ivy Bridge") != std::string::npos || ainfo.name.find("Haswell") != std::string::npos ||
+       ainfo.name.find("Broadwell") != std::string::npos || ainfo.name.find("(IVB") != std::string::npos ||
+       ainfo.name.find("(HSW") != std::string::npos || ainfo.name.find("(BDW") != std::string::npos))
+  {
+    INFO_LOG("Not using Vulkan for Intel GPU with incomplete driver.");
+    return false;
+  }
+
+  // V3D is buggy, image copies with larger textures are broken.
+  if (ainfo.driver_type == GPUDriverType::BroadcomMesa)
+  {
+    INFO_LOG("Not using Vulkan for V3D GPU with buggy driver.");
+    return false;
+  }
+#endif
+
+  INFO_LOG("Allowing Vulkan as default renderer.");
+  return true;
+}
+
+GPUDriverType VulkanLoader::GuessDriverType(const VkPhysicalDeviceProperties& device_properties,
+                                            const VkPhysicalDeviceDriverProperties& driver_properties)
+{
+  static constexpr const std::pair<VkDriverId, GPUDriverType> table[] = {
+    {VK_DRIVER_ID_NVIDIA_PROPRIETARY, GPUDriverType::NVIDIAProprietary},
+    {VK_DRIVER_ID_AMD_PROPRIETARY, GPUDriverType::AMDProprietary},
+    {VK_DRIVER_ID_AMD_OPEN_SOURCE, GPUDriverType::AMDProprietary},
+    {VK_DRIVER_ID_MESA_RADV, GPUDriverType::AMDMesa},
+    {VK_DRIVER_ID_NVIDIA_PROPRIETARY, GPUDriverType::NVIDIAProprietary},
+    {VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS, GPUDriverType::IntelProprietary},
+    {VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, GPUDriverType::IntelMesa},
+    {VK_DRIVER_ID_IMAGINATION_PROPRIETARY, GPUDriverType::ImaginationProprietary},
+    {VK_DRIVER_ID_QUALCOMM_PROPRIETARY, GPUDriverType::QualcommProprietary},
+    {VK_DRIVER_ID_ARM_PROPRIETARY, GPUDriverType::ARMProprietary},
+    {VK_DRIVER_ID_GOOGLE_SWIFTSHADER, GPUDriverType::SwiftShader},
+    {VK_DRIVER_ID_GGP_PROPRIETARY, GPUDriverType::Unknown},
+    {VK_DRIVER_ID_BROADCOM_PROPRIETARY, GPUDriverType::BroadcomProprietary},
+    {VK_DRIVER_ID_MESA_LLVMPIPE, GPUDriverType::LLVMPipe},
+    {VK_DRIVER_ID_MOLTENVK, GPUDriverType::AppleProprietary},
+    {VK_DRIVER_ID_COREAVI_PROPRIETARY, GPUDriverType::Unknown},
+    {VK_DRIVER_ID_JUICE_PROPRIETARY, GPUDriverType::Unknown},
+    {VK_DRIVER_ID_VERISILICON_PROPRIETARY, GPUDriverType::Unknown},
+    {VK_DRIVER_ID_MESA_TURNIP, GPUDriverType::QualcommMesa},
+    {VK_DRIVER_ID_MESA_V3DV, GPUDriverType::BroadcomMesa},
+    {VK_DRIVER_ID_MESA_PANVK, GPUDriverType::ARMMesa},
+    {VK_DRIVER_ID_SAMSUNG_PROPRIETARY, GPUDriverType::AMDProprietary},
+    {VK_DRIVER_ID_MESA_VENUS, GPUDriverType::Unknown},
+    {VK_DRIVER_ID_MESA_DOZEN, GPUDriverType::DozenMesa},
+    {VK_DRIVER_ID_MESA_NVK, GPUDriverType::NVIDIAMesa},
+    {VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA, GPUDriverType::ImaginationMesa},
+    {VK_DRIVER_ID_MESA_HONEYKRISP, GPUDriverType::AppleMesa},
+  };
+
+  const auto iter = std::find_if(std::begin(table), std::end(table), [&driver_properties](const auto& it) {
+    return (driver_properties.driverID == it.first);
+  });
+  if (iter != std::end(table))
+    return iter->second;
+
+  return GPUDevice::GuessDriverType(
+    device_properties.vendorID, {},
+    std::string_view(device_properties.deviceName,
+                     StringUtil::Strnlen(device_properties.deviceName, std::size(device_properties.deviceName))));
+}
+
+std::optional<GPUDevice::AdapterInfoList> VulkanLoader::GetAdapterList(WindowInfoType window_type, Error* error)
+{
+  GPUList gpus;
+  {
+    const std::lock_guard lock(s_locals.mutex);
+
+    // Prefer re-using the instance if we can to avoid expensive loading.
+    if (s_locals.instance != VK_NULL_HANDLE)
+    {
+      gpus = EnumerateGPUs(error);
+    }
+    else
+    {
+      // Otherwise we need to create a temporary instance.
+      // Hold the lock for both creation and querying, otherwise the UI thread could race creation.
+      if (!LockedCreateVulkanInstance(window_type, nullptr, g_settings.gpu_use_debug_device_gpu_validation, error))
+        return std::nullopt;
+
+      gpus = EnumerateGPUs(error);
+
+      LockedReleaseVulkanInstance();
+    }
+  }
+
+  if (gpus.empty())
+    return std::nullopt;
+
+  GPUDevice::AdapterInfoList ret;
+  ret.reserve(gpus.size());
+  for (size_t i = 0; i < gpus.size(); i++)
+    ret.push_back(std::move(gpus[i].second));
+
+  return ret;
+}
+
+VkBool32 VulkanLoader::DebugMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                              VkDebugUtilsMessageTypeFlagsEXT messageType,
+                                              const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+                                              void* pUserData)
+{
+  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+  {
+    ERROR_LOG("Vulkan debug report: ({}) {}", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
+              pCallbackData->pMessage);
+  }
+  else if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT))
+  {
+    WARNING_LOG("Vulkan debug report: ({}) {}", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
+                pCallbackData->pMessage);
+  }
+  else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
+  {
+    INFO_LOG("Vulkan debug report: ({}) {}", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
+             pCallbackData->pMessage);
+  }
+  else
+  {
+    DEV_LOG("Vulkan debug report: ({}) {}", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
+            pCallbackData->pMessage);
+  }
+
+  return VK_FALSE;
+}

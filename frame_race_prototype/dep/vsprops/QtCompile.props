@@ -1,0 +1,356 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="UserMacros">
+    <BinaryOutputDir>$(SolutionDir)bin\$(Platform)\</BinaryOutputDir>
+    <DSQTDIRDefault Condition="'$(Platform)'=='x64'">$(SolutionDir)dep\prebuilt\windows-x64\</DSQTDIRDefault>
+    <DSQTDIRDefault Condition="'$(Platform)'=='ARM64'">$(SolutionDir)dep\prebuilt\windows-arm64\</DSQTDIRDefault>
+    <DSQTDIR Condition="Exists('$(DSQTDIRDefault)') And ('$(DSQTDIR)'=='' Or !Exists('$(DSQTDIR)'))">$(DSQTDIRDefault)</DSQTDIR>
+    <DSQTDIR Condition="Exists('$(DSQTDIR)') And !HasTrailingSlash('$(DSQTDIR)')">$(DSQTDIR)\</DSQTDIR>
+    <DSQTDIRHost>$(SolutionDir)dep\prebuilt\windows-x64\</DSQTDIRHost>
+    <DSQTDIRValid>false</DSQTDIRValid>
+    <DSQTDIRValid Condition="Exists('$(DSQTDIR)')">true</DSQTDIRValid>
+    <QtIncludeDir>$(DSQTDIR)include\</QtIncludeDir>
+    <QtLibDir>$(DSQTDIR)lib\</QtLibDir>
+    <QtBinDir>$(DSQTDIR)bin\</QtBinDir>
+    <QtHostBinDir>$(DSQTDIRHost)bin\</QtHostBinDir>
+    <QtPluginsDir>$(DSQTDIR)plugins\</QtPluginsDir>
+    <QtTranslationsDir>$(DSQTDIR)translations\</QtTranslationsDir>
+    <QtToolOutDir>$(IntDir)</QtToolOutDir>
+    <QtMocOutPrefix>$(QtToolOutDir)moc_</QtMocOutPrefix>
+    <QtTsOutDir>$(BinaryOutputDir)translations\</QtTsOutDir>
+    <QtRccOutDir>$(BinaryOutputDir)resources\</QtRccOutDir>
+    <QtDebugSuffix>d</QtDebugSuffix>
+    <QtLibSuffix Condition="$(Configuration.Contains(Debug))">$(QtDebugSuffix)</QtLibSuffix>
+    <QtPluginFolder>QtPlugins</QtPluginFolder>
+    <QtEntryPointLib>$(QtLibDir)Qt6EntryPoint$(QtLibSuffix).lib</QtEntryPointLib>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions Condition="!$(Configuration.Contains(Debug))">QT_NO_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Work around broken deprecated warning bug in MSVC non-debug -->
+      <PreprocessorDefinitions Condition="!$(Configuration.Contains(Clang)) And !$(Configuration.Contains(Debug))">QT_NO_DEPRECATED_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(QtToolOutDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(QtIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(QtLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Qt6Core$(QtLibSuffix).lib;Qt6Gui$(QtLibSuffix).lib;Qt6Widgets$(QtLibSuffix).lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!--Passes all .qrc files to rcc and puts output in the build directory-->
+  <Target Name="QtResourcePrepare"
+    Condition="'@(QtResource)'!=''">
+    <ItemGroup>
+      <QtResource>
+        <DependencyCache>$(QtToolOutDir)rcc_%(QtResource.Filename).inputs</DependencyCache>
+      </QtResource>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="QtResourceDependencies"
+    DependsOnTargets="QtResourcePrepare"
+    Condition="'@(QtResource)'!=''"
+    Inputs="%(QtResource.FullPath);$(QtHostBinDir)rcc.exe"
+    Outputs="%(QtResource.DependencyCache)">
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtToolOutDir)" />
+    <!-- Cache rcc's authoritative file list per .qrc; target batching keeps each manifest independent. -->
+    <Exec
+      Command="&quot;$(QtHostBinDir)rcc.exe&quot; --list &quot;%(QtResource.FullPath)&quot;"
+      ConsoleToMSBuild="true"
+      StandardOutputImportance="Low">
+      <Output TaskParameter="ConsoleOutput" ItemName="_QtResourceDependency" />
+    </Exec>
+    <WriteLinesToFile
+      File="%(QtResource.DependencyCache)"
+      Lines="@(_QtResourceDependency)"
+      Overwrite="true" />
+    <ItemGroup>
+      <_QtResourceDependency Remove="@(_QtResourceDependency)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="QtResource"
+    AfterTargets="Build"
+    DependsOnTargets="QtResourceDependencies"
+    Condition="'@(QtResource)'!=''"
+    Outputs="%(QtResource.DependencyCache)">
+    <!-- Outputs intentionally forces one target batch per .qrc; with no Inputs, GetOutOfDateItems still decides whether rcc runs. -->
+    <ReadLinesFromFile File="%(QtResource.DependencyCache)">
+      <Output TaskParameter="Lines" ItemName="_QtResourceDependency" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <QtResource>
+        <AdditionalInputs>%(QtResource.FullPath);@(_QtResourceDependency)</AdditionalInputs>
+        <Command>&quot;$(QtHostBinDir)rcc.exe&quot; -binary -no-compress &quot;%(QtResource.FullPath)&quot; -o &quot;$(QtRccOutDir)%(QtResource.Filename).rcc&quot;</Command>
+        <Outputs>$(QtRccOutDir)%(QtResource.Filename).rcc</Outputs>
+      </QtResource>
+    </ItemGroup>
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtRccOutDir)" />
+    <!-- C++ projects use these tlogs for both incremental builds and Visual Studio's project-level up-to-date check. -->
+    <GetOutOfDateItems
+      Sources="@(QtResource)"
+      OutputsMetadataName="Outputs"
+      DependenciesMetadataName="AdditionalInputs"
+      CommandMetadataName="Command"
+      TLogDirectory="$(TLogLocation)"
+      TLogNamePrefix="QtResource_%(QtResource.Filename)"
+      CheckForInterdependencies="false">
+      <Output TaskParameter="OutOfDateSources" ItemName="_QtResourceOutOfDate" />
+    </GetOutOfDateItems>
+    <Message Condition="'@(_QtResourceOutOfDate)'!=''" Text="rcc %(_QtResourceOutOfDate.Filename)" Importance="High" />
+    <!-- rcc stamps every entry with the mtime of its source file, i.e. the checkout time. Pin it to the commit date instead. -->
+    <Exec
+      Condition="'@(_QtResourceOutOfDate)'!='' And '$(SOURCE_DATE_EPOCH)'==''"
+      Command="git -C &quot;$(SolutionDir).&quot; log -1 --format=%25%25ct"
+      ConsoleToMSBuild="true"
+      IgnoreExitCode="true"
+      IgnoreStandardErrorWarningFormat="true"
+      StandardOutputImportance="Low"
+      StandardErrorImportance="Low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_QtResourceCommitDate" />
+      <Output TaskParameter="ExitCode" PropertyName="_QtResourceCommitDateExitCode" />
+    </Exec>
+    <PropertyGroup>
+      <_QtResourceSourceDate>$(SOURCE_DATE_EPOCH)</_QtResourceSourceDate>
+      <_QtResourceSourceDate Condition="'$(_QtResourceSourceDate)'=='' And '$(_QtResourceCommitDateExitCode)'=='0'">$(_QtResourceCommitDate)</_QtResourceSourceDate>
+    </PropertyGroup>
+    <Exec
+      Condition="'@(_QtResourceOutOfDate)'!=''"
+      Command="%(_QtResourceOutOfDate.Command)"
+      EnvironmentVariables="SOURCE_DATE_EPOCH=$(_QtResourceSourceDate)" />
+    <ItemGroup>
+      <_QtResourceOutOfDate Remove="@(_QtResourceOutOfDate)" />
+      <_QtResourceDependency Remove="@(_QtResourceDependency)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="QtResourceClean" DependsOnTargets="QtResourcePrepare">
+    <Delete Files="@(QtResource->'$(QtRccOutDir)%(Filename).rcc')" />
+    <Delete Files="@(QtResource->'%(DependencyCache)')" />
+  </Target>
+
+  <!--Passes all .ui files to uic and puts output in the build directory-->
+  <Target Name="QtUi"
+    BeforeTargets="ClCompile"
+    Condition="'@(QtUi)'!=''">
+    <ItemGroup>
+      <QtUi>
+        <AdditionalInputs>%(QtUi.FullPath)</AdditionalInputs>
+        <Command>&quot;$(QtHostBinDir)uic.exe&quot; &quot;%(QtUi.FullPath)&quot; -o &quot;$(QtToolOutDir)ui_%(QtUi.Filename).h&quot;</Command>
+        <Message>uic %(QtUi.Filename)</Message>
+        <Outputs>$(QtToolOutDir)ui_%(QtUi.Filename).h</Outputs>
+      </QtUi>
+    </ItemGroup>
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtToolOutDir)" />
+    <!-- Track UI inputs and outputs in native tlogs, then generate only stale forms concurrently. -->
+    <GetOutOfDateItems
+      Sources="@(QtUi)"
+      OutputsMetadataName="Outputs"
+      DependenciesMetadataName="AdditionalInputs"
+      CommandMetadataName="Command"
+      TLogDirectory="$(TLogLocation)"
+      TLogNamePrefix="QtUi"
+      CheckForInterdependencies="false">
+      <Output TaskParameter="OutOfDateSources" ItemName="_QtUiOutOfDate" />
+    </GetOutOfDateItems>
+    <ParallelCustomBuild
+      Condition="'@(_QtUiOutOfDate)'!=''"
+      Sources="@(_QtUiOutOfDate)" />
+    <ItemGroup>
+      <_QtUiOutOfDate Remove="@(_QtUiOutOfDate)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="QtUiClean">
+    <Delete Files="@(QtUi->'$(QtToolOutDir)ui_%(Filename).h')" />
+  </Target>
+
+  <!--Compile files needed to MOC and output in the build directory-->
+  <!--TODO find a way to autocreate from ClCompile settings-->
+  <PropertyGroup>
+    <MocDefines></MocDefines>
+    <MocDefines Condition="!$(Configuration.Contains(Debug))">-DQT_NO_DEBUG -DNDEBUG $(MocDefines)</MocDefines>
+    <MocIncludes>-I"$(QtIncludeDir)." -I.</MocIncludes>
+  </PropertyGroup>
+  <Target Name="QtMoc"
+    BeforeTargets="ClCompile"
+    Condition="'@(QtMoc)'!=''">
+    <ItemGroup>
+      <QtMoc>
+        <AdditionalInputs>%(QtMoc.FullPath);%(QtMoc.AdditionalDependencies)</AdditionalInputs>
+        <Command>&quot;$(QtHostBinDir)moc.exe&quot; &quot;%(QtMoc.FullPath)&quot; -o &quot;$(QtToolOutDir)%(QtMoc.RelativeDir)moc_%(QtMoc.Filename).cpp&quot; -f%(QtMoc.Filename)%(QtMoc.Extension) $(MocDefines) $(MocIncludes)</Command>
+        <Message>moc %(QtMoc.Filename) $(QtToolOutDir)%(QtMoc.RelativeDir)moc_%(QtMoc.Filename).cpp</Message>
+        <Outputs>$(QtToolOutDir)%(QtMoc.RelativeDir)moc_%(QtMoc.Filename).cpp</Outputs>
+      </QtMoc>
+    </ItemGroup>
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtToolOutDir)" />
+    <!-- Track the effective command instead of the project-file timestamp, which changes for unrelated project edits. -->
+    <GetOutOfDateItems
+      Sources="@(QtMoc)"
+      OutputsMetadataName="Outputs"
+      DependenciesMetadataName="AdditionalInputs"
+      CommandMetadataName="Command"
+      TLogDirectory="$(TLogLocation)"
+      TLogNamePrefix="QtMoc"
+      CheckForInterdependencies="false">
+      <Output TaskParameter="OutOfDateSources" ItemName="_QtMocOutOfDate" />
+    </GetOutOfDateItems>
+    <!-- ParallelCustomBuild runs the independent stale MOC commands concurrently using its native scheduler. -->
+    <ParallelCustomBuild
+      Condition="'@(_QtMocOutOfDate)'!=''"
+      Sources="@(_QtMocOutOfDate)" />
+    <ItemGroup>
+      <_QtMocOutOfDate Remove="@(_QtMocOutOfDate)" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <MocOutputs Include="$(QtToolOutDir)moc_*.cpp" />
+  </ItemGroup>
+  <Target Name="QtMocClean">
+    <Delete Files="@(MocOutputs)" />
+  </Target>
+
+  <!--Expose the new targets to VS-->
+  <ItemGroup>
+    <PropertyPageSchema Include="$(MSBuildThisFileDirectory)$(MSBuildThisFileName).xml" />
+    <AvailableItemName Include="QtResource">
+      <Targets>QtResource</Targets>
+    </AvailableItemName>
+    <AvailableItemName Include="QtUi">
+      <Targets>QtUi</Targets>
+    </AvailableItemName>
+    <AvailableItemName Include="QtMoc">
+      <Targets>QtMoc</Targets>
+    </AvailableItemName>
+    <AvailableItemName Include="QtTs">
+      <Targets>QtTs</Targets>
+    </AvailableItemName>
+  </ItemGroup>
+
+  <!--Copy the needed dlls-->
+  <ItemGroup>
+    <QtLibNames Include="Qt6Core$(QtLibSuffix);Qt6Gui$(QtLibSuffix);Qt6Widgets$(QtLibSuffix)" />
+    <QtDlls Include="@(QtLibNames -> '$(QtBinDir)%(Identity).dll')" />
+    <QtPluginNames Include="platforms\qoffscreen;platforms\qwindows;platforms\qminimal" />
+    <QtPluginNames Include="imageformats\qwebp;imageformats\qicns;imageformats\qwbmp;imageformats\qtiff;imageformats\qtga;imageformats\qgif;imageformats\qjpeg;imageformats\qico" />
+    <QtPluginNames Include="generic\qtuiotouchplugin;styles\qmodernwindowsstyle;networkinformation\qnetworklistmanager" />
+    <QtPlugins Include="@(QtPluginNames -> '$(QtPluginsDir)%(Identity)$(QtLibSuffix).dll')" />
+    <QtPluginsDest Include="@(QtPluginNames -> '$(BinaryOutputDir)$(QtPluginFolder)\%(Identity)$(QtLibSuffix).dll')" />
+  </ItemGroup>
+  <PropertyGroup>
+    <QtConfFile>$(BinaryOutputDir)qt.conf</QtConfFile>
+  </PropertyGroup>
+  <Target Name="QtCopyBinaries"
+    AfterTargets="Build"
+    Inputs="@(QtDlls);@(QtPlugins)"
+    Outputs="@(QtDlls -> '$(BinaryOutputDir)%(RecursiveDir)%(Filename)%(Extension)');@(QtPluginsDest)">
+    <Message Text="Copying Qt .dlls" />
+    <Copy
+      SourceFiles="@(QtDlls)"
+      DestinationFolder="$(BinaryOutputDir)"
+      SkipUnchangedFiles="true"
+    />
+    <Copy
+      SourceFiles="@(QtPlugins)"
+      DestinationFiles="@(QtPluginsDest)"
+      SkipUnchangedFiles="true"
+    />
+  </Target>
+  <Target Name="QtCreateConf"
+    BeforeTargets="QtCopyBinaries"
+    Condition="!Exists('$(QtConfFile)')">
+    <!--
+      Create a file which tells Qt where to look for "plugins".
+      Otherwise Qt only looks in ./<subtype>/type.dll instead of ./$(QtPluginFolder)/<subtype>/type.dll, which is messy
+      -->
+    <WriteLinesToFile
+      File="$(QtConfFile)"
+      Lines="[Paths];Plugins = ./$(QtPluginFolder)"
+      Overwrite="true"
+    />
+  </Target>
+  
+  <!--Copies base translation files, and combines split into one -->
+  <ItemGroup>
+    <AllQmFiles Include="$(QtTranslationsDir)qt*.qm">
+      <Language>$([System.String]::Copy('%(Filename)').Substring($([MSBuild]::Add($([System.String]::Copy('%(Filename)').IndexOf('_')), 1))))</Language>
+    </AllQmFiles>
+    <BaseQmFiles Include="$(QtTranslationsDir)qtbase_*.qm" />
+    <SourceMergeQmFileNames Include="@(BaseQmFiles -> '%(Filename)%(Extension)'->Replace('qtbase_', 'qt_'))" />
+    <SourceMergeQmFiles Include="@(SourceMergeQmFileNames -> '$(QtTranslationsDir)%(Filename)%(Extension)')" />
+    <MergedQmFiles Include="@(SourceMergeQmFileNames -> '$(QtTsOutDir)%(Filename)%(Extension)')">
+      <Language>$([System.String]::Copy('%(Filename)').Replace('qt_', ''))</Language>
+    </MergedQmFiles>
+    <!-- Create list of qt_*.qm files in source directory that correspond to qtbase_*.qm files -->
+    <QtFilesToExcludeFromCopy Include="@(BaseQmFiles -> '%(Filename)%(Extension)'->Replace('qtbase_', '$(QtTranslationsDir)qt_'))" />
+    <CopyTsFilesSource Include="$(QtTranslationsDir)qt_*.qm" Exclude="@(QtFilesToExcludeFromCopy);$(QtTranslationsDir)\qt_help_*.qm" />
+    <CopyTsFilesDest Include="@(CopyTsFilesSource -> '$(QtTsOutDir)%(Filename)%(Extension)')" />
+  </ItemGroup>
+  <Target Name="QtGenerateBaseTranslations" AfterTargets="Build" Inputs="@(SourceMergeQmFiles)" Outputs="%(MergedQmFiles.FullPath)">
+    <PropertyGroup>
+      <Language>%(MergedQmFiles.Language)</Language>
+    </PropertyGroup>
+    <Message Text="Generate Base Translation qt_$(Language).qm" Importance="High" />
+    <ItemGroup>
+      <!-- Exclude qt_*.qm files from source files to prevent circular inclusion -->
+      <SourceQmFiles Include="%(AllQmFiles.FullPath)" Condition="'%(AllQmFiles.Language)' == '$(Language)' And !$([System.String]::Copy('%(AllQmFiles.Filename)').StartsWith('qt_'))" />
+    </ItemGroup>
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtTsOutDir)" />
+    <Exec Command="&quot;$(QtHostBinDir)lconvert.exe&quot; -verbose -of qm -o &quot;$(QtTsOutDir)qt_$(Language).qm&quot; @(SourceQmFiles -> '&quot;%(FullPath)&quot;', ' ')" EchoOff="false" />
+  </Target>
+  <Target Name="QtCopyBaseTranslations"
+    AfterTargets="Build"
+    Inputs="@(CopyTsFilesSource)"
+    Outputs="@(CopyTsFilesDest.FullPath)">
+      <Message Text="Copy Base Translation %(CopyTsFilesSource.Filename)%(CopyTsFilesSource.Extension)" />
+      <Copy SourceFiles="@(CopyTsFilesSource)" DestinationFiles="@(CopyTsFilesDest)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <!--Compiles all translation files-->
+  <Target Name="QtTs"
+    BeforeTargets="ClCompile"
+    Condition="'@(QtTs)'!=''">
+    <ItemGroup>
+      <QtTs>
+        <AdditionalInputs>%(QtTs.FullPath)</AdditionalInputs>
+        <Command>&quot;$(QtHostBinDir)lrelease.exe&quot; &quot;%(QtTs.FullPath)&quot; -qm &quot;$(QtTsOutDir)%(QtTs.Filename).qm&quot;</Command>
+        <Message>lrelease %(QtTs.Filename)</Message>
+        <Outputs>$(QtTsOutDir)%(QtTs.Filename).qm</Outputs>
+      </QtTs>
+    </ItemGroup>
+    <Error Condition="!$(DSQTDIRValid)" Text="Qt directory non-existent (download/extract the zip)" />
+    <MakeDir Directories="$(QtTsOutDir)" />
+    <!-- C++ projects use these tlogs for both incremental builds and Visual Studio's project-level up-to-date check. -->
+    <GetOutOfDateItems
+      Sources="@(QtTs)"
+      OutputsMetadataName="Outputs"
+      DependenciesMetadataName="AdditionalInputs"
+      CommandMetadataName="Command"
+      TLogDirectory="$(TLogLocation)"
+      TLogNamePrefix="QtTs"
+      CheckForInterdependencies="false">
+      <Output TaskParameter="OutOfDateSources" ItemName="_QtTsOutOfDate" />
+    </GetOutOfDateItems>
+    <!-- Translation catalogs are independent, so only stale items are submitted to the parallel custom-build scheduler. -->
+    <ParallelCustomBuild
+      Condition="'@(_QtTsOutOfDate)'!=''"
+      Sources="@(_QtTsOutOfDate)" />
+    <ItemGroup>
+      <_QtTsOutOfDate Remove="@(_QtTsOutOfDate)" />
+    </ItemGroup>
+  </Target>
+  <ItemGroup>
+    <TsOutputs Include="$(QtTsOutDir)*.qm" />
+  </ItemGroup>
+  <Target Name="QtTsClean">
+    <Delete Files="@(TsOutputs)" />
+  </Target>
+</Project>

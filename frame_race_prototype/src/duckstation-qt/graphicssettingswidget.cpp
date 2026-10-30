@@ -1,0 +1,1449 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "graphicssettingswidget.h"
+#include "qthost.h"
+#include "qtutils.h"
+#include "qtwindowinfo.h"
+#include "settingswindow.h"
+#include "settingwidgetbinder.h"
+
+#include "core/core.h"
+#include "core/fullscreenui_widgets.h"
+#include "core/game_database.h"
+#include "core/gpu.h"
+#include "core/settings.h"
+
+#include "util/imgui_manager.h"
+#include "util/ini_settings_interface.h"
+
+#include "common/error.h"
+#include "common/log.h"
+
+#include <QtCore/QDir>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QFileDialog>
+#include <QtWidgets/QInputDialog>
+#include <algorithm>
+
+#include "moc_graphicssettingswidget.cpp"
+
+using namespace Qt::StringLiterals;
+
+LOG_CHANNEL(Host);
+
+static QVariant GetMSAAModeValue(uint multisamples, bool ssaa)
+{
+  const uint userdata = (multisamples & 0x7FFFFFFFu) | (static_cast<uint>(ssaa) << 31);
+  return QVariant(userdata);
+}
+
+static void DecodeMSAAModeValue(const QVariant& userdata, uint* multisamples, bool* ssaa)
+{
+  bool ok;
+  const uint value = userdata.toUInt(&ok);
+  if (!ok || value == 0)
+  {
+    *multisamples = 1;
+    *ssaa = false;
+    return;
+  }
+
+  *multisamples = value & 0x7FFFFFFFu;
+  *ssaa = (value & (1u << 31)) != 0u;
+}
+
+GraphicsSettingsWidget::GraphicsSettingsWidget(SettingsWindow* dialog, QWidget* parent)
+  : QWidget(parent), m_dialog(dialog)
+{
+  SettingsInterface* sif = dialog->getSettingsInterface();
+
+  m_ui.setupUi(this);
+  QtUtils::FixSpinBoxTextMargins(this);
+  removePlatformSpecificUi();
+
+  // Rendering Tab
+
+  connect(m_dialog, &SettingsWindow::debugOptionsVisibilityChanged, this,
+          &GraphicsSettingsWidget::onShowDebugSettingsChanged);
+
+  if (!m_dialog->isPerGameSettings())
+    connect(m_ui.renderer, &QComboBox::currentIndexChanged, this, &GraphicsSettingsWidget::warnAboutRendererChange);
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.renderer, Settings::GPU_SECTION_NAME, "Renderer", &Settings::ParseRendererName,
+    &Settings::GetRendererName, &Settings::GetRendererDisplayName, Settings::DEFAULT_GPU_RENDERER, GPURenderer::Count);
+  if (!m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaling))
+    populateAndConnectUpscalingModes();
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.textureFiltering, Settings::GPU_SECTION_NAME, "TextureFilter",
+                                               &Settings::ParseTextureFilterName, &Settings::GetTextureFilterName,
+                                               &Settings::GetTextureFilterDisplayName,
+                                               Settings::DEFAULT_GPU_TEXTURE_FILTER, GPUTextureFilter::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.spriteTextureFiltering, Settings::GPU_SECTION_NAME,
+                                               "SpriteTextureFilter", &Settings::ParseTextureFilterName,
+                                               &Settings::GetTextureFilterName, &Settings::GetTextureFilterDisplayName,
+                                               Settings::DEFAULT_GPU_TEXTURE_FILTER, GPUTextureFilter::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.gpuDitheringMode, Settings::GPU_SECTION_NAME, "DitheringMode",
+                                               &Settings::ParseGPUDitheringModeName, &Settings::GetGPUDitheringModeName,
+                                               &Settings::GetGPUDitheringModeDisplayName,
+                                               Settings::DEFAULT_GPU_DITHERING_MODE, GPUDitheringMode::MaxCount);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.gpuDownsampleMode, Settings::GPU_SECTION_NAME, "DownsampleMode", &Settings::ParseDownsampleModeName,
+    &Settings::GetDownsampleModeName, &Settings::GetDownsampleModeDisplayName, Settings::DEFAULT_GPU_DOWNSAMPLE_MODE,
+    GPUDownsampleMode::Count);
+  createAspectRatioSetting(m_ui.displayAspectRatio, m_ui.customAspectRatioNumerator, m_ui.customAspectRatioSeparator,
+                           m_ui.customAspectRatioDenominator, sif);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.widescreenHack, Settings::GPU_SECTION_NAME, "WidescreenHack",
+                                               false);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.displayDeinterlacing, Settings::GPU_SECTION_NAME, "DeinterlacingMode",
+    &Settings::ParseDisplayDeinterlacingMode, &Settings::GetDisplayDeinterlacingModeName,
+    &Settings::GetDisplayDeinterlacingModeDisplayName, Settings::DEFAULT_DISPLAY_DEINTERLACING_MODE,
+    DisplayDeinterlacingMode::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.displayCropMode, Settings::DISPLAY_SECTION_NAME, "CropMode",
+                                               &Settings::ParseDisplayCropMode, &Settings::GetDisplayCropModeName,
+                                               &Settings::GetDisplayCropModeDisplayName,
+                                               Settings::DEFAULT_DISPLAY_CROP_MODE, DisplayCropMode::MaxCount);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.displayScaling, Settings::DISPLAY_SECTION_NAME, "Scaling",
+                                               &Settings::ParseDisplayScaling, &Settings::GetDisplayScalingName,
+                                               &Settings::GetDisplayScalingDisplayName,
+                                               Settings::DEFAULT_DISPLAY_SCALING, DisplayScalingMode::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.displayScaling24Bit, Settings::DISPLAY_SECTION_NAME, "Scaling24Bit", &Settings::ParseDisplayScaling,
+    &Settings::GetDisplayScalingName, &Settings::GetDisplayScalingDisplayName, Settings::DEFAULT_DISPLAY_SCALING,
+    DisplayScalingMode::Count);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.gpuDownsampleScale, Settings::GPU_SECTION_NAME,
+                                              "DownsampleScale", 1);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpEnable, Settings::GPU_SECTION_NAME, "PGXPEnable", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpDepthBuffer, Settings::GPU_SECTION_NAME, "PGXPDepthBuffer",
+                                               false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.force43For24Bit, Settings::DISPLAY_SECTION_NAME,
+                                               "Force4_3For24Bit", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.chromaSmoothingFor24Bit, Settings::GPU_SECTION_NAME,
+                                               "ChromaSmoothing24Bit", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.forceRoundedTexcoords, Settings::GPU_SECTION_NAME,
+                                               "ForceRoundTextureCoordinates", false);
+
+  connect(m_ui.renderer, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::updateRendererDependentOptions);
+  connect(m_ui.textureFiltering, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::updateResolutionDependentOptions);
+  connect(m_ui.spriteTextureFiltering, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::updateResolutionDependentOptions);
+  connect(m_ui.gpuDownsampleMode, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::onDownsampleModeChanged);
+  connect(m_ui.pgxpEnable, &QCheckBox::checkStateChanged, this, &GraphicsSettingsWidget::updatePGXPSettingsEnabled);
+
+  SettingWidgetBinder::SetAvailability(m_ui.renderer,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::ForceSoftwareRenderer));
+  SettingWidgetBinder::SetAvailability(m_ui.resolutionScale,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaling));
+  SettingWidgetBinder::SetAvailability(m_ui.textureFiltering,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering));
+  SettingWidgetBinder::SetAvailability(m_ui.spriteTextureFiltering,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering) ||
+                                         !m_dialog->hasGameTrait(GameDatabase::Trait::DisableSpriteTextureFiltering));
+  SettingWidgetBinder::SetAvailability(m_ui.pgxpEnable, !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXP));
+  SettingWidgetBinder::SetAvailability(m_ui.pgxpDepthBuffer,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPDepthBuffer));
+  SettingWidgetBinder::SetAvailability(m_ui.widescreenHack,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableWidescreen));
+
+  // Advanced Tab
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.exclusiveFullscreenControl, Settings::DISPLAY_SECTION_NAME, "ExclusiveFullscreenControl",
+    &Settings::ParseDisplayExclusiveFullscreenControl, &Settings::GetDisplayExclusiveFullscreenControlName,
+    &Settings::GetDisplayExclusiveFullscreenControlDisplayName, Settings::DEFAULT_DISPLAY_EXCLUSIVE_FULLSCREEN_CONTROL,
+    DisplayExclusiveFullscreenControl::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.displayAlignment, Settings::DISPLAY_SECTION_NAME, "Alignment",
+                                               &Settings::ParseDisplayAlignment, &Settings::GetDisplayAlignmentName,
+                                               &Settings::GetDisplayAlignmentDisplayName,
+                                               Settings::DEFAULT_DISPLAY_ALIGNMENT, DisplayAlignment::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.displayRotation, Settings::DISPLAY_SECTION_NAME, "Rotation",
+                                               &Settings::ParseDisplayRotation, &Settings::GetDisplayRotationName,
+                                               &Settings::GetDisplayRotationDisplayName,
+                                               Settings::DEFAULT_DISPLAY_ROTATION, DisplayRotation::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.displayFineCropMode, Settings::DISPLAY_SECTION_NAME, "FineCropMode", &Settings::ParseDisplayFineCropMode,
+    &Settings::GetDisplayFineCropModeName, &Settings::GetDisplayFineCropModeDisplayName,
+    Settings::DEFAULT_DISPLAY_FINE_CROP_MODE, DisplayFineCropMode::MaxCount);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.displayFineCropLeft, Settings::DISPLAY_SECTION_NAME,
+                                              "FineCropLeft", 0);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.displayFineCropTop, Settings::DISPLAY_SECTION_NAME,
+                                              "FineCropTop", 0);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.displayFineCropRight, Settings::DISPLAY_SECTION_NAME,
+                                              "FineCropRight", 0);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.displayFineCropBottom, Settings::DISPLAY_SECTION_NAME,
+                                              "FineCropBottom", 0);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableMailboxPresentation, Settings::DISPLAY_SECTION_NAME,
+                                               "DisableMailboxPresentation", false);
+#ifdef _WIN32
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.blitSwapChain, Settings::DISPLAY_SECTION_NAME,
+                                               "UseBlitSwapChain", false);
+#endif
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.gpuLineDetectMode, Settings::GPU_SECTION_NAME, "LineDetectMode", &Settings::ParseLineDetectModeName,
+    &Settings::GetLineDetectModeName, &Settings::GetLineDetectModeDisplayName, Settings::DEFAULT_GPU_LINE_DETECT_MODE,
+    GPULineDetectMode::Count);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.gpuThread, Settings::GPU_SECTION_NAME, "UseThread", true);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.maxQueuedFrames, Settings::GPU_SECTION_NAME, "MaxQueuedFrames",
+                                              Settings::DEFAULT_GPU_MAX_QUEUED_FRAMES);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.scaledInterlacing, Settings::GPU_SECTION_NAME,
+                                               "ScaledInterlacing", true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableUpscaledDirectTextures, Settings::GPU_SECTION_NAME,
+                                               "DisableUpscaledDirectTextures", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.filterFramebufferUploads, Settings::GPU_SECTION_NAME,
+                                               "FilterFramebufferUploads", false);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.filterFramebufferUploadsMinimumWidth,
+                                              Settings::GPU_SECTION_NAME, "FilterFramebufferUploadsMinimumWidth", 1);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.filterFramebufferUploadsMinimumHeight,
+                                              Settings::GPU_SECTION_NAME, "FilterFramebufferUploadsMinimumHeight", 1);
+  connect(m_ui.filterFramebufferUploads, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::updateResolutionDependentOptions);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useSoftwareRendererForReadbacks, Settings::GPU_SECTION_NAME,
+                                               "UseSoftwareRendererForReadbacks", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.midFrameScanout, Settings::GPU_SECTION_NAME, "MidFrameScanout",
+                                               false);
+
+  connect(m_ui.displayFineCropMode, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::onFineCropModeChanged);
+  connect(m_ui.displayFineCropReset, &QPushButton::clicked, this, &GraphicsSettingsWidget::onFineCropResetClicked);
+  connect(m_ui.gpuThread, &QCheckBox::checkStateChanged, this, &GraphicsSettingsWidget::onGPUThreadChanged);
+
+  SettingWidgetBinder::SetAvailability(m_ui.scaledInterlacing,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisableScaledInterlacing));
+  SettingWidgetBinder::SetForceEnabled(m_ui.useSoftwareRendererForReadbacks,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::ForceSoftwareRendererForReadbacks));
+  SettingWidgetBinder::SetForceEnabled(
+    m_ui.forceRoundedTexcoords, m_dialog->hasGameTrait(GameDatabase::Trait::ForceRoundUpscaledTextureCoordinates));
+  SettingWidgetBinder::SetForceEnabled(m_ui.disableUpscaledDirectTextures,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaledDirectTextures));
+  SettingWidgetBinder::SetForceEnabled(m_ui.filterFramebufferUploads,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::FilterFramebufferUploads));
+  SettingWidgetBinder::SetForceEnabled(m_ui.midFrameScanout,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::ForceMidFrameScanout));
+
+  // PGXP Tab
+
+  SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.pgxpGeometryTolerance, Settings::GPU_SECTION_NAME,
+                                                "PGXPTolerance", -1.0f);
+  SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.pgxpDepthClearThreshold, Settings::GPU_SECTION_NAME,
+                                                "PGXPDepthThreshold", Settings::DEFAULT_GPU_PGXP_DEPTH_THRESHOLD);
+  SettingWidgetBinder::BindWidgetToFloatSetting(sif, m_ui.pgxpDepthBias, Settings::GPU_SECTION_NAME, "PGXPDepthBias",
+                                                Settings::DEFAULT_GPU_PGXP_DEPTH_BIAS);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpTextureCorrection, Settings::GPU_SECTION_NAME,
+                                               "PGXPTextureCorrection", true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpColorCorrection, Settings::GPU_SECTION_NAME,
+                                               "PGXPColorCorrection", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpCulling, Settings::GPU_SECTION_NAME, "PGXPCulling", true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpPreserveProjPrecision, Settings::GPU_SECTION_NAME,
+                                               "PGXPPreserveProjFP", false);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.pgxpCPU, Settings::GPU_SECTION_NAME, "PGXPCPU", &Settings::ParseSettingOverrideModeName,
+    &Settings::GetSettingOverrideModeName, &Settings::GetSettingOverrideModeDisplayName, SettingOverrideMode::Automatic,
+    SettingOverrideMode::Count);
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.pgxpVertexCache, Settings::GPU_SECTION_NAME, "PGXPVertexCache", &Settings::ParseSettingOverrideModeName,
+    &Settings::GetSettingOverrideModeName, &Settings::GetSettingOverrideModeDisplayName, SettingOverrideMode::Automatic,
+    SettingOverrideMode::Count);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpDisableOn2DPolygons, Settings::GPU_SECTION_NAME,
+                                               "PGXPDisableOn2DPolygons", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpTransparentDepthTest, Settings::GPU_SECTION_NAME,
+                                               "PGXPTransparentDepthTest", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.pgxpNormalizeDepth, Settings::GPU_SECTION_NAME,
+                                               "PGXPNormalizeDepth", false);
+
+  connect(m_ui.pgxpTextureCorrection, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::updatePGXPSettingsEnabled);
+  connect(m_ui.pgxpDepthBuffer, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::updatePGXPSettingsEnabled);
+  connect(m_ui.resetPGXPGeometryTolerance, &QPushButton::clicked, this,
+          &GraphicsSettingsWidget::onResetPGXPGeometryToleranceClicked);
+  connect(m_ui.resetPGXPDepthClearThreshold, &QPushButton::clicked, this,
+          &GraphicsSettingsWidget::onResetPGXPDepthClearThresholdClicked);
+  connect(m_ui.resetPGXPDepthBias, &QPushButton::clicked, this, &GraphicsSettingsWidget::onResetPGXPDepthBiasClicked);
+
+  SettingWidgetBinder::SetAvailability(m_ui.pgxpTextureCorrection,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPTextureCorrection));
+  SettingWidgetBinder::SetAvailability(m_ui.pgxpColorCorrection,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPColorCorrection));
+  SettingWidgetBinder::SetAvailability(m_ui.pgxpCulling,
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPCulling));
+  SettingWidgetBinder::SetForceEnabled(m_ui.pgxpDisableOn2DPolygons,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPOn2DPolygons));
+  SettingWidgetBinder::SetForceEnabled(m_ui.pgxpNormalizeDepth,
+                                       m_dialog->hasGameTrait(GameDatabase::Trait::NormalizePGXPDepth));
+  if (const GameDatabase::Entry* dbentry = m_dialog->getDatabaseEntry();
+      dbentry && dbentry->gpu_pgxp_preserve_proj_fp.has_value(dbentry->override_mask))
+  {
+    if (dbentry->gpu_pgxp_preserve_proj_fp.value())
+      SettingWidgetBinder::SetForceEnabled(m_ui.pgxpPreserveProjPrecision, true);
+    else
+      SettingWidgetBinder::SetAvailability(m_ui.pgxpPreserveProjPrecision, false);
+  }
+
+  // Texture Replacements Tab
+
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableTextureCache, Settings::GPU_SECTION_NAME,
+                                               "EnableTextureCache", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.preloadTextureReplacements,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "PreloadTextures", false);
+
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableTextureReplacements,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "EnableTextureReplacements",
+                                               false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.alwaysTrackUploads, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "AlwaysTrackUploads", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.enableTextureDumping,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTextures", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.dumpReplacedTextures, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpReplacedTextures", true);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.vramWriteReplacement, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "EnableVRAMWriteReplacements", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.vramWriteDumping, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME,
+                                               "DumpVRAMWrites", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useOldMDECRoutines, Settings::HACKS_SECTION_NAME,
+                                               "UseOldMDECRoutines", false);
+
+  if (!m_dialog->isPerGameSettings())
+  {
+    SettingWidgetBinder::BindWidgetToFolderSetting(sif, m_ui.texturesDirectory, m_ui.texturesDirectoryBrowse,
+                                                   tr("Select Textures Directory"), m_ui.texturesDirectoryOpen,
+                                                   m_ui.texturesDirectoryReset, Settings::FOLDERS_SECTION_NAME,
+                                                   "Textures", Path::Combine(EmuFolders::DataRoot, "textures"));
+  }
+  else
+  {
+    m_ui.tabTextureReplacementsLayout->removeWidget(m_ui.texturesDirectoryGroup);
+    delete m_ui.texturesDirectoryGroup;
+    m_ui.texturesDirectoryGroup = nullptr;
+    m_ui.texturesDirectoryBrowse = nullptr;
+    m_ui.texturesDirectoryOpen = nullptr;
+    m_ui.texturesDirectoryReset = nullptr;
+    m_ui.texturesDirectoryLabel = nullptr;
+    m_ui.texturesDirectory = nullptr;
+  }
+
+  connect(m_ui.enableTextureCache, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::onEnableTextureCacheChanged);
+  connect(m_ui.enableTextureReplacements, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::onEnableAnyTextureReplacementsChanged);
+  connect(m_ui.enableTextureDumping, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::onEnableAnyTextureDumpingChanged);
+  connect(m_ui.vramWriteReplacement, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::onEnableAnyTextureReplacementsChanged);
+  connect(m_ui.vramWriteDumping, &QCheckBox::checkStateChanged, this,
+          &GraphicsSettingsWidget::onEnableAnyTextureDumpingChanged);
+  connect(m_ui.textureReplacementOptions, &QPushButton::clicked, this,
+          &GraphicsSettingsWidget::onTextureReplacementOptionsClicked);
+
+  // Debugging Tab
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(sif, m_ui.gpuWireframeMode, Settings::GPU_SECTION_NAME, "WireframeMode",
+                                               Settings::ParseGPUWireframeMode, Settings::GetGPUWireframeModeName,
+                                               &Settings::GetGPUWireframeModeDisplayName,
+                                               Settings::DEFAULT_GPU_WIREFRAME_MODE, GPUWireframeMode::Count);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.gpuDisableTextures, Settings::GPU_SECTION_NAME,
+                                               "DisableTextures", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.gpuDisableVertexLighting, Settings::GPU_SECTION_NAME,
+                                               "DisableVertexLighting", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.modulationCrop, Settings::GPU_SECTION_NAME,
+                                               "EnableModulationCrop", false);
+
+  SettingWidgetBinder::BindWidgetToEnumSetting(
+    sif, m_ui.gpuDumpCompressionMode, Settings::GPU_SECTION_NAME, "DumpCompressionMode",
+    &Settings::ParseGPUDumpCompressionMode, &Settings::GetGPUDumpCompressionModeName,
+    &Settings::GetGPUDumpCompressionModeDisplayName, Settings::DEFAULT_GPU_DUMP_COMPRESSION_MODE,
+    GPUDumpCompressionMode::MaxCount);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.gpuDumpFastReplayMode, Settings::GPU_SECTION_NAME,
+                                               "DumpFastReplayMode", false);
+
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useDebugDevice, Settings::GPU_SECTION_NAME, "UseDebugDevice",
+                                               false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useGPUBasedValidation, Settings::GPU_SECTION_NAME,
+                                               "UseGPUBasedValidation", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.preferGLESContext, Settings::GPU_SECTION_NAME,
+                                               "PreferGLESContext", Settings::DEFAULT_GPU_PREFER_GLES_CONTEXT);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableShaderCache, Settings::GPU_SECTION_NAME,
+                                               "DisableShaderCache", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableDualSource, Settings::GPU_SECTION_NAME,
+                                               "DisableDualSourceBlend", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableFramebufferFetch, Settings::GPU_SECTION_NAME,
+                                               "DisableFramebufferFetch", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableTextureBuffers, Settings::GPU_SECTION_NAME,
+                                               "DisableTextureBuffers", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableTextureCopyToSelf, Settings::GPU_SECTION_NAME,
+                                               "DisableTextureCopyToSelf", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableMemoryImport, Settings::GPU_SECTION_NAME,
+                                               "DisableMemoryImport", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableRasterOrderViews, Settings::GPU_SECTION_NAME,
+                                               "DisableRasterOrderViews", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableComputeShaders, Settings::GPU_SECTION_NAME,
+                                               "DisableComputeShaders", false);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.disableCompressedTextures, Settings::GPU_SECTION_NAME,
+                                               "DisableCompressedTextures", false);
+
+  // Init all dependent options.
+  updateRendererDependentOptions();
+  onDownsampleModeChanged();
+  onFineCropModeChanged();
+  onEnableTextureCacheChanged();
+  onEnableAnyTextureReplacementsChanged();
+  onGPUThreadChanged();
+  onShowDebugSettingsChanged(QtHost::ShouldShowDebugOptions());
+
+  // Rendering Tab
+
+  dialog->registerWidgetHelp(
+    m_ui.renderer, tr("Renderer"), QString::fromUtf8(Settings::GetRendererDisplayName(Settings::DEFAULT_GPU_RENDERER)),
+    tr("Selects the backend to use for rendering the console/game visuals. <br>Depending on your system and hardware, "
+       "Direct3D 11 and OpenGL hardware backends may be available. <br>The software renderer offers the best "
+       "compatibility, but is the slowest and does not offer any enhancements."));
+  dialog->registerWidgetHelp(
+    m_ui.adapter, tr("Adapter"), tr("(Default)"),
+    tr("If your system contains multiple GPUs or adapters, you can select which GPU you wish to use for the hardware "
+       "renderers. <br>This option is only supported in Direct3D and Vulkan. OpenGL will always use the default "
+       "device."));
+  dialog->registerWidgetHelp(
+    m_ui.resolutionScale, tr("Internal Resolution"), "1x",
+    tr("Setting this beyond 1x will enhance the resolution of rendered 3D polygons and lines. Only applies "
+       "to the hardware backends. <br>This option is usually safe, with most games looking fine at "
+       "higher resolutions. Higher resolutions require a more powerful GPU."));
+  dialog->registerWidgetHelp(
+    m_ui.gpuDownsampleMode, tr("Down-Sampling"), tr("Disabled"),
+    tr("Downsamples the rendered image prior to displaying it. Can improve overall image quality in mixed 2D/3D games, "
+       "but should be disabled for pure 3D games."));
+  dialog->registerWidgetHelp(m_ui.gpuDownsampleScale, tr("Down-Sampling Display Scale"), tr("1x"),
+                             tr("Selects the resolution scale that will be applied to the final image. 1x will "
+                                "downsample to the original console resolution."));
+  dialog->registerWidgetHelp(
+    m_ui.textureFiltering, tr("Texture Filtering"),
+    QString::fromUtf8(Settings::GetTextureFilterDisplayName(Settings::DEFAULT_GPU_TEXTURE_FILTER)),
+    tr("Smooths out the blockiness of magnified textures on 3D objects by using filtering. <br>Will have a "
+       "greater effect on higher resolution scales."));
+  dialog->registerWidgetHelp(
+    m_ui.spriteTextureFiltering, tr("Sprite Texture Filtering"),
+    QString::fromUtf8(Settings::GetTextureFilterDisplayName(Settings::DEFAULT_GPU_TEXTURE_FILTER)),
+    tr("Smooths out the blockiness of magnified textures on 2D objects by using filtering. This filter only applies to "
+       "sprites and other 2D elements, such as the HUD."));
+  dialog->registerWidgetHelp(
+    m_ui.gpuDitheringMode, tr("Dithering"),
+    QString::fromUtf8(Settings::GetGPUDitheringModeDisplayName(Settings::DEFAULT_GPU_DITHERING_MODE)),
+    tr("Controls how dithering is applied in the emulated GPU. True Color disables dithering and produces the nicest "
+       "looking gradients. Scaled options make the dither pattern less noticeable at higher resolutions. Shader "
+       "Blending options perform blending in software, and are more accurate but have a <strong>significant</strong> "
+       "performance penalty."));
+  dialog->registerWidgetHelp(
+    m_ui.displayAspectRatio, tr("Aspect Ratio"),
+    QtUtils::StringViewToQString(Settings::GetDisplayAspectRatioDisplayName(Settings::DEFAULT_DISPLAY_ASPECT_RATIO)),
+    tr("Changes the aspect ratio used to display the console's output to the screen. The default is Auto (Game Native) "
+       "which automatically adjusts the aspect ratio to match how a game would be shown on a typical TV of the era."));
+  dialog->registerWidgetHelp(
+    m_ui.displayDeinterlacing, tr("Deinterlacing"),
+    QString::fromUtf8(Settings::GetDisplayDeinterlacingModeDisplayName(Settings::DEFAULT_DISPLAY_DEINTERLACING_MODE)),
+    tr("Determines which algorithm is used to convert interlaced frames to progressive for display on your system. "
+       "Using progressive rendering provides the best quality output, but some games require interlaced rendering."));
+  dialog->registerWidgetHelp(
+    m_ui.displayCropMode, tr("Crop"),
+    QString::fromUtf8(Settings::GetDisplayCropModeDisplayName(Settings::DEFAULT_DISPLAY_CROP_MODE)),
+    tr("Determines how much of the area typically not visible on a consumer TV set to crop/hide. Some games display "
+       "content in the overscan area, or use it for screen effects. May not display correctly with the \"All Borders\" "
+       "setting. \"Only Overscan\" offers a good compromise between stability and hiding black borders."));
+  dialog->registerWidgetHelp(
+    m_ui.displayScaling, tr("Scaling"), tr("Bilinear (Smooth)"),
+    tr("Determines how the emulated console's output is upscaled or downscaled to your monitor's resolution."));
+  dialog->registerWidgetHelp(
+    m_ui.displayScaling24Bit, tr("FMV Scaling"), tr("Bilinear (Smooth)"),
+    tr("Determines the scaling algorithm used when 24-bit content is active, typically FMVs."));
+  dialog->registerWidgetHelp(
+    m_ui.widescreenHack, tr("Widescreen Rendering"), tr("Unchecked"),
+    tr("Scales vertex positions in screen-space to a widescreen aspect ratio, essentially "
+       "increasing the field of view from 4:3 to the chosen display aspect ratio in 3D games. <b><u>May not be "
+       "compatible with all games.</u></b>"));
+  dialog->registerWidgetHelp(m_ui.pgxpEnable, tr("PGXP Geometry Correction"), tr("Unchecked"),
+                             tr("Reduces \"wobbly\" polygons and \"warping\" textures that are common in PS1 games. "
+                                "<strong>May not be compatible with all games.</strong>"));
+  dialog->registerWidgetHelp(
+    m_ui.pgxpDepthBuffer, tr("PGXP Depth Buffer"), tr("Unchecked"),
+    tr("Attempts to reduce polygon Z-fighting by testing pixels against the depth values from PGXP. Low compatibility, "
+       "but can work well in some games. Other games may need a threshold adjustment."));
+  dialog->registerWidgetHelp(
+    m_ui.force43For24Bit, tr("Force 4:3 For FMVs"), tr("Unchecked"),
+    tr("Switches back to 4:3 display aspect ratio when displaying 24-bit content, usually FMVs."));
+  dialog->registerWidgetHelp(m_ui.chromaSmoothingFor24Bit, tr("FMV Chroma Smoothing"), tr("Unchecked"),
+                             tr("Smooths out blockyness between colour transitions in 24-bit content, usually FMVs."));
+  dialog->registerWidgetHelp(
+    m_ui.forceRoundedTexcoords, tr("Round Upscaled Texture Coordinates"), tr("Unchecked"),
+    tr("Rounds texture coordinates instead of flooring when upscaling. Can fix misaligned textures in some games, but "
+       "break others, and is incompatible with texture filtering."));
+
+  // Advanced Tab
+
+  dialog->registerWidgetHelp(m_ui.fullscreenMode, tr("Fullscreen Mode"), tr("Borderless Fullscreen"),
+                             tr("Chooses the fullscreen resolution and frequency."));
+  dialog->registerWidgetHelp(m_ui.exclusiveFullscreenControl, tr("Exclusive Fullscreen Control"), tr("Automatic"),
+                             tr("Controls whether exclusive fullscreen can be utilized by Vulkan drivers."));
+  dialog->registerWidgetHelp(
+    m_ui.displayAlignment, tr("Position"),
+    QString::fromUtf8(Settings::GetDisplayAlignmentDisplayName(Settings::DEFAULT_DISPLAY_ALIGNMENT)),
+    tr("Determines the position on the screen when black borders must be added."));
+  dialog->registerWidgetHelp(m_ui.displayFineCropMode, tr("Fine Crop Mode"), tr("None"),
+                             tr("Enables manual fine cropping of the display area, while preserving the aspect ratio "
+                                "of the image. Useful for removing black borders in certain games."));
+  dialog->registerWidgetHelp(
+    m_ui.disableMailboxPresentation, tr("Disable Mailbox Presentation"), tr("Unchecked"),
+    tr("Forces the use of FIFO over Mailbox presentation, i.e. double buffering instead of triple buffering. "
+       "Usually results in worse frame pacing."));
+#ifdef _WIN32
+  dialog->registerWidgetHelp(m_ui.blitSwapChain, tr("Use Blit Swap Chain"), tr("Unchecked"),
+                             tr("Uses a blit presentation model instead of flipping when using the Direct3D 11 "
+                                "renderer. This usually results in slower performance, but may be required for some "
+                                "streaming applications, or to uncap framerates on some systems."));
+#endif
+
+  dialog->registerWidgetHelp(
+    m_ui.gpuLineDetectMode, tr("Line Detection"),
+    QString::fromUtf8(Settings::GetLineDetectModeDisplayName(Settings::DEFAULT_GPU_LINE_DETECT_MODE)),
+    tr("Attempts to detect one pixel high/wide lines that rely on non-upscaled rasterization "
+       "behavior, filling in gaps introduced by upscaling."));
+  dialog->registerWidgetHelp(
+    m_ui.msaaMode, tr("Multi-Sampling"), tr("Disabled"),
+    tr("Uses multi-sampled anti-aliasing when rendering 3D polygons. Can improve visuals with a lower performance "
+       "requirement compared to upscaling, <strong>but often introduces rendering errors.</strong>"));
+  dialog->registerWidgetHelp(m_ui.gpuThread, tr("Threaded Rendering"), tr("Checked"),
+                             tr("Uses a second thread for drawing graphics. Provides a significant speed improvement "
+                                "particularly with the software renderer, and is safe to use."));
+  dialog->registerWidgetHelp(
+    m_ui.modulationCrop, tr("Texture Modulation Cropping (\"Old/v0\" GPU)"), tr("Unchecked"),
+    tr("Crops vertex colours to 5:5:5 before modulating with the texture colour, which typically results in more "
+       "visible banding. This is a characteristic of the \"old\" GPUs found in early model consoles."));
+  dialog->registerWidgetHelp(m_ui.scaledInterlacing, tr("Scaled Interlacing"), tr("Checked"),
+                             tr("Scales line skipping in interlaced rendering to the internal resolution. This makes "
+                                "the combing less obvious at higher resolutions. Usually safe to enable."));
+  dialog->registerWidgetHelp(
+    m_ui.disableUpscaledDirectTextures, tr("Disable Upscaled Direct Textures"), tr("Unchecked"),
+    tr("Samples 16-bit direct-color textures at native resolution when upscaling. This can fix filtering of "
+       "FMVs/backgrounds in some games, but may reduce the quality of render-to-texture effects."));
+  dialog->registerWidgetHelp(
+    m_ui.midFrameScanout, tr("Mid-Frame Scanout"), tr("Unchecked"),
+    tr("Applies changes to the displayed framebuffer partway through a frame, instead of at the start of the next "
+       "frame. Some games rely on this for split-screen effects, but it causes tearing in games that switch "
+       "framebuffers mid-frame, so only enable it for games that need it."));
+  dialog->registerWidgetHelp(
+    m_ui.filterFramebufferUploads, tr("Filter Framebuffer Uploads"), tr("Unchecked"),
+    tr("Applies the selected sprite texture filter to framebuffer uploads. This can smooth backgrounds in some "
+       "games while preserving texture data and 24-bit video."));
+  dialog->registerWidgetHelp(
+    m_ui.filterFramebufferUploadsMinimumWidth, tr("Minimum Framebuffer Upload Width"), tr("1 px"),
+    tr("Only filters framebuffer uploads at least this wide. Increase this value to avoid filtering texture data."));
+  dialog->registerWidgetHelp(
+    m_ui.filterFramebufferUploadsMinimumHeight, tr("Minimum Framebuffer Upload Height"), tr("1 px"),
+    tr("Only filters framebuffer uploads at least this tall. Increase this value to avoid filtering texture data."));
+  dialog->registerWidgetHelp(
+    m_ui.useSoftwareRendererForReadbacks, tr("Software Renderer Readbacks"), tr("Unchecked"),
+    tr("Runs the software renderer in parallel for VRAM readbacks. On some systems, this may result in greater "
+       "performance when using graphical enhancements with the hardware renderer."));
+
+  // PGXP Tab
+
+  dialog->registerWidgetHelp(
+    m_ui.pgxpGeometryTolerance, tr("Geometry Tolerance"), tr("-1.00px (Disabled)"),
+    tr("Discards precise geometry when it is found to be offset past the specified threshold. This can help with games "
+       "that have vertices significantly moved by PGXP, but is still a hack/workaround."));
+  dialog->registerWidgetHelp(m_ui.pgxpDepthClearThreshold, tr("Depth Clear Threshold"),
+                             QStringLiteral("%1").arg(Settings::DEFAULT_GPU_PGXP_DEPTH_THRESHOLD),
+                             tr("Determines the increase in depth that will result in the depth buffer being cleared. "
+                                "Can help with depth issues in some games, but is still a hack/workaround."));
+  dialog->registerWidgetHelp(m_ui.pgxpDepthBias, tr("Depth Bias"),
+                             QStringLiteral("%1").arg(Settings::DEFAULT_GPU_PGXP_DEPTH_BIAS),
+                             tr("Brings each polygon closer to the camera than the polygons drawn before it, in "
+                                "millionths of depth. Higher values reduce flickering of decals and shadows, but "
+                                "can cause polygons to show through surfaces in front of them."));
+  dialog->registerWidgetHelp(m_ui.pgxpTextureCorrection, tr("Perspective Correct Textures"), tr("Checked"),
+                             tr("Uses perspective-correct interpolation for texture coordinates, straightening out "
+                                "warped textures. Requires geometry correction enabled."));
+  dialog->registerWidgetHelp(
+    m_ui.pgxpColorCorrection, tr("Perspective Correct Colors"), tr("Unchecked"),
+    tr("Uses perspective-correct interpolation for vertex colors, which can improve visuals in some games, but cause "
+       "rendering errors in others. Requires geometry correction enabled."));
+  dialog->registerWidgetHelp(m_ui.pgxpCulling, tr("Culling Correction"), tr("Checked"),
+                             tr("Increases the precision of polygon culling, reducing the number of holes in geometry. "
+                                "Requires geometry correction enabled."));
+  dialog->registerWidgetHelp(
+    m_ui.pgxpPreserveProjPrecision, tr("Preserve Projection Precision"), tr("Unchecked"),
+    tr("Adds additional precision to PGXP data post-projection. May improve visuals in some games."));
+  dialog->registerWidgetHelp(m_ui.pgxpCPU, tr("CPU Mode"), tr("Automatic"),
+                             tr("Uses PGXP for all instructions, not just memory operations. Required for PGXP to "
+                                "correct wobble in some games, but has a high performance cost. Automatic enables it "
+                                "only for games that require it according to the game database."));
+  dialog->registerWidgetHelp(
+    m_ui.pgxpVertexCache, tr("Vertex Cache"), tr("Automatic"),
+    tr("Uses screen-space vertex positions to obtain precise positions, instead of tracking memory accesses. Can "
+       "provide PGXP compatibility for some games, but <strong>generally provides no benefit.</strong> Automatic "
+       "enables it only for games that require it according to the game database."));
+  dialog->registerWidgetHelp(m_ui.pgxpDisableOn2DPolygons, tr("Disable on 2D Polygons"), tr("Unchecked"),
+                             tr("Uses native resolution coordinates for 2D polygons, instead of precise coordinates. "
+                                "Can fix misaligned UI in some games, but otherwise should be left disabled. The game "
+                                "database will enable this automatically when needed."));
+  dialog->registerWidgetHelp(m_ui.pgxpTransparentDepthTest, tr("Depth Test Transparent Polygons"), tr("Unchecked"),
+                             tr("Enables depth testing for semi-transparent polygons. Usually these include shadows, "
+                                "and tend to clip through the ground when depth testing is enabled. Depth writes for "
+                                "semi-transparent polygons are disabled regardless of this setting."));
+  dialog->registerWidgetHelp(
+    m_ui.pgxpNormalizeDepth, tr("Normalize Depth Scale"), tr("Unchecked"),
+    tr("Removes the scale of each object's transform from depth values. Fixes missing geometry with the depth buffer "
+       "in games which shrink the transforms of distant objects, but breaks games which scale models through the "
+       "transform. The game database will enable this automatically when needed."));
+
+  // Texture Replacements Tab
+  dialog->registerWidgetHelp(
+    m_ui.enableTextureCache, tr("Enable Texture Cache"), tr("Unchecked"),
+    tr("Enables caching of guest textures, required for texture replacement. <strong>The texture cache is currently "
+       "experimental, and may cause rendering errors in some games.</strong>"));
+  dialog->registerWidgetHelp(m_ui.preloadTextureReplacements, tr("Preload Texture Replacements"), tr("Unchecked"),
+                             tr("Loads all replacement texture to RAM, reducing stuttering at runtime."));
+
+  dialog->registerWidgetHelp(m_ui.enableTextureReplacements, tr("Enable Texture Replacements"), tr("Unchecked"),
+                             tr("Enables loading of replacement textures. Not compatible with all games."));
+  dialog->registerWidgetHelp(
+    m_ui.alwaysTrackUploads, tr("Always Track Uploads"), tr("Unchecked"),
+    tr("Forces texture upload tracking to be enabled regardless of whether it is needed. Reduces performance, but "
+       "allows toggling replacements on and off. <strong>Not required for replacements to load, </strong>normally "
+       "tracking is automatically enabled when needed."));
+  dialog->registerWidgetHelp(
+    m_ui.enableTextureDumping, tr("Enable Texture Dumping"), tr("Unchecked"),
+    tr("Enables dumping of textures to image files, which can be replaced. Not compatible with all games."));
+  dialog->registerWidgetHelp(m_ui.dumpReplacedTextures, tr("Dump Replaced Textures"), tr("Checked"),
+                             tr("Dumps textures that have replacements already loaded."));
+
+  dialog->registerWidgetHelp(m_ui.vramWriteReplacement, tr("Enable VRAM Write Replacement"), tr("Unchecked"),
+                             tr("Enables the replacement of background textures in supported games."));
+  dialog->registerWidgetHelp(m_ui.vramWriteDumping, tr("Enable VRAM Write Dumping"), tr("Unchecked"),
+                             tr("Writes backgrounds that can be replaced to the dump directory."));
+  dialog->registerWidgetHelp(m_ui.useOldMDECRoutines, tr("Use Old MDEC Routines"), tr("Unchecked"),
+                             tr("Enables the older, less accurate MDEC decoding routines. May be required for old "
+                                "replacement backgrounds to match/load."));
+
+  // Debugging Tab
+
+  dialog->registerWidgetHelp(m_ui.gpuWireframeMode, tr("Wireframe Mode"), tr("Disabled"),
+                             tr("Draws a wireframe outline of the triangles rendered by the console's GPU, either as a "
+                                "replacement or an overlay."));
+  dialog->registerWidgetHelp(
+    m_ui.gpuDisableTextures, tr("Disable Textures"), tr("Unchecked"),
+    tr("Disables texture emulation in the GPU, forcing all primitives to only show vertex colours."));
+  dialog->registerWidgetHelp(
+    m_ui.gpuDisableVertexLighting, tr("Disable Vertex Lighting"), tr("Unchecked"),
+    tr("Disables vertex lighting in the GPU, forcing all primitives to only show raw texture colours."));
+  dialog->registerWidgetHelp(
+    m_ui.useDebugDevice, tr("Use Debug Device"), tr("Unchecked"),
+    tr("Enable debugging when supported by the host's renderer API. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(
+    m_ui.useGPUBasedValidation, tr("Use GPU-Based Validation"), tr("Unchecked"),
+    tr("Enable GPU-based validation when supported by the renderer API. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(
+    m_ui.preferGLESContext, tr("Prefer OpenGL ES Context"), tr("Unchecked"),
+    tr("Uses OpenGL ES even when desktop OpenGL is supported. May improve performance on some SBC drivers."));
+  dialog->registerWidgetHelp(
+    m_ui.disableShaderCache, tr("Disable Shader Cache"), tr("Unchecked"),
+    tr("Forces shaders to be compiled for every run of the program. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableDualSource, tr("Disable Dual-Source Blending"), tr("Unchecked"),
+                             tr("Prevents dual-source blending from being used. Useful for testing broken graphics "
+                                "drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableFramebufferFetch, tr("Disable Framebuffer Fetch"), tr("Unchecked"),
+                             tr("Prevents the framebuffer fetch extensions from being used. Useful for testing broken "
+                                "graphics drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(
+    m_ui.disableTextureBuffers, tr("Disable Texture Buffers"), tr("Unchecked"),
+    tr("Forces VRAM updates through texture updates, instead of texture buffers and draws. Useful for testing broken "
+       "graphics drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableTextureCopyToSelf, tr("Disable Texture Copies To Self"), tr("Unchecked"),
+                             tr("Disables the use of self-copy updates for the VRAM texture. Useful for testing broken "
+                                "graphics drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableMemoryImport, tr("Disable Memory Import"), tr("Unchecked"),
+                             tr("Disables the use of host memory importing. Useful for testing broken graphics "
+                                "drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableRasterOrderViews, tr("Disable Rasterizer Order Views"), tr("Unchecked"),
+                             tr("Disables the use of rasterizer order views. Useful for testing broken graphics "
+                                "drivers. <strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableComputeShaders, tr("Disable Compute Shaders"), tr("Unchecked"),
+                             tr("Disables the use of compute shaders. Useful for testing broken graphics drivers. "
+                                "<strong>Only for developer use.</strong>"));
+  dialog->registerWidgetHelp(m_ui.disableCompressedTextures, tr("Disable Compressed Textures"), tr("Unchecked"),
+                             tr("Disables the use of compressed textures. Useful for testing broken graphics drivers. "
+                                "<strong>Only for developer use.</strong>"));
+}
+
+GraphicsSettingsWidget::~GraphicsSettingsWidget() = default;
+
+void GraphicsSettingsWidget::removePlatformSpecificUi()
+{
+#ifndef _WIN32
+  m_ui.advancedDisplayOptionsLayout->removeWidget(m_ui.blitSwapChain);
+  delete m_ui.blitSwapChain;
+  m_ui.blitSwapChain = nullptr;
+#endif
+}
+
+GPURenderer GraphicsSettingsWidget::getEffectiveRenderer() const
+{
+  return Settings::ParseRendererName(
+           m_dialog
+             ->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "Renderer",
+                                       Settings::GetRendererName(Settings::DEFAULT_GPU_RENDERER))
+             .c_str())
+    .value_or(Settings::DEFAULT_GPU_RENDERER);
+}
+
+bool GraphicsSettingsWidget::effectiveRendererIsHardware() const
+{
+  return (getEffectiveRenderer() != GPURenderer::Software);
+}
+
+void GraphicsSettingsWidget::onShowDebugSettingsChanged(bool enabled)
+{
+  m_ui.tabs->setTabVisible(TAB_INDEX_DEBUGGING, enabled);
+}
+
+void GraphicsSettingsWidget::updateRendererDependentOptions()
+{
+  const GPURenderer renderer = getEffectiveRenderer();
+  const RenderAPI render_api = Settings::GetRenderAPIForRenderer(renderer);
+  const bool is_hardware = (renderer != GPURenderer::Software);
+
+  m_ui.resolutionScale->setEnabled(is_hardware && !m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaling));
+  m_ui.resolutionScaleLabel->setEnabled(is_hardware && !m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaling));
+  m_ui.msaaMode->setEnabled(is_hardware);
+  m_ui.msaaModeLabel->setEnabled(is_hardware);
+  m_ui.textureFiltering->setEnabled(is_hardware &&
+                                    !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering));
+  m_ui.textureFilteringLabel->setEnabled(is_hardware &&
+                                         !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering));
+  m_ui.spriteTextureFiltering->setEnabled(is_hardware &&
+                                          !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering) &&
+                                          !m_dialog->hasGameTrait(GameDatabase::Trait::DisableSpriteTextureFiltering));
+  m_ui.spriteTextureFilteringLabel->setEnabled(
+    is_hardware && !m_dialog->hasGameTrait(GameDatabase::Trait::DisableTextureFiltering) &&
+    !m_dialog->hasGameTrait(GameDatabase::Trait::DisableSpriteTextureFiltering));
+  m_ui.gpuDownsampleLabel->setEnabled(is_hardware);
+  m_ui.gpuDownsampleMode->setEnabled(is_hardware);
+  m_ui.gpuDownsampleScale->setEnabled(is_hardware);
+  m_ui.gpuDitheringModeLabel->setEnabled(is_hardware);
+  m_ui.gpuDitheringMode->setEnabled(is_hardware);
+  m_ui.pgxpEnable->setEnabled(is_hardware && !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXP));
+
+  m_ui.gpuLineDetectMode->setEnabled(is_hardware);
+  m_ui.gpuLineDetectModeLabel->setEnabled(is_hardware);
+  m_ui.gpuWireframeMode->setEnabled(is_hardware);
+  m_ui.gpuWireframeModeLabel->setEnabled(is_hardware);
+  m_ui.scaledInterlacing->setEnabled(is_hardware &&
+                                     !m_dialog->hasGameTrait(GameDatabase::Trait::DisableScaledInterlacing));
+  m_ui.useSoftwareRendererForReadbacks->setEnabled(
+    is_hardware && !m_dialog->hasGameTrait(GameDatabase::Trait::ForceSoftwareRendererForReadbacks));
+
+  m_ui.tabs->setTabEnabled(TAB_INDEX_TEXTURE_REPLACEMENTS, is_hardware);
+
+#ifdef _WIN32
+  m_ui.blitSwapChain->setVisible(render_api == RenderAPI::D3D11);
+#endif
+
+  populateGPUAdaptersAndResolutions(render_api);
+  updatePGXPSettingsEnabled();
+  updateResolutionDependentOptions();
+}
+
+void GraphicsSettingsWidget::populateGPUAdaptersAndResolutions(RenderAPI render_api)
+{
+  // Don't re-query, it's expensive.
+  if (m_adapters_render_api != render_api)
+  {
+    m_adapters_render_api = render_api;
+
+    QtAsyncTask::create(this, [this, render_api]() {
+      Error error;
+      std::optional<GPUDevice::AdapterInfoList> adapters =
+        GPUDevice::GetAdapterListForAPI(render_api, QtUtils::GetWindowInfoType(), &error);
+      if (!adapters.has_value())
+      {
+        ERROR_LOG("Failed to get adapter list for {} API: {}", GPUDevice::RenderAPIToString(render_api),
+                  error.GetDescription());
+        adapters.emplace();
+      }
+
+      return [this, adapters = std::move(adapters.value()), render_api]() mutable {
+        if (m_adapters_render_api != render_api)
+          return;
+
+        m_adapters = std::move(adapters);
+        populateGPUAdaptersAndResolutions(render_api);
+      };
+    });
+
+    return;
+  }
+
+  const GPUDevice::AdapterInfo* current_adapter = nullptr;
+  SettingsInterface* const sif = m_dialog->getSettingsInterface();
+
+  {
+    SettingWidgetBinder::DisconnectWidget(m_ui.adapter);
+    m_ui.adapter->clear();
+    m_ui.adapter->addItem(tr("Default"), QVariant(QString()));
+
+    const std::string current_adapter_name =
+      m_dialog->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "Adapter", "");
+    for (const GPUDevice::AdapterInfo& adapter : m_adapters)
+    {
+      if (adapter.name.empty())
+        continue;
+
+      const QString qadaptername = QString::fromStdString(adapter.name);
+      m_ui.adapter->addItem(qadaptername, QVariant(qadaptername));
+      if (adapter.name == current_adapter_name)
+        current_adapter = &adapter;
+    }
+
+    if (!m_adapters.empty())
+    {
+      if (current_adapter_name.empty())
+      {
+        // default adapter
+        current_adapter = &m_adapters.front();
+      }
+      else if (!current_adapter)
+      {
+        // if the adapter is not available, ensure it's in the list anyway, otherwise select the default
+        const QString qadaptername = QString::fromStdString(current_adapter_name);
+        m_ui.adapter->addItem(tr("%1 [Unavailable]").arg(qadaptername), QVariant(qadaptername));
+      }
+    }
+
+    // disable it if we don't have a choice
+    m_ui.adapter->setEnabled(!m_adapters.empty());
+    m_ui.adapterLabel->setEnabled(!m_adapters.empty());
+    SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.adapter, Settings::GPU_SECTION_NAME, "Adapter");
+    connect(m_ui.adapter, &QComboBox::currentIndexChanged, this,
+            &GraphicsSettingsWidget::updateRendererDependentOptions);
+  }
+
+  {
+    SettingWidgetBinder::DisconnectWidget(m_ui.fullscreenMode);
+    m_ui.fullscreenMode->clear();
+
+    m_ui.fullscreenMode->addItem(tr("Borderless Fullscreen"), QVariant(QString()));
+
+    const std::string current_fullscreen_mode =
+      m_dialog->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "FullscreenMode", "");
+    bool current_fullscreen_mode_found = false;
+    if (current_adapter)
+    {
+      for (const GPUDevice::ExclusiveFullscreenMode& mode : current_adapter->fullscreen_modes)
+      {
+        const TinyString mode_str = mode.ToString();
+        current_fullscreen_mode_found = current_fullscreen_mode_found || (current_fullscreen_mode == mode_str.view());
+
+        const QString qmodename = QtUtils::StringViewToQString(mode_str);
+        m_ui.fullscreenMode->addItem(qmodename, QVariant(qmodename));
+      }
+    }
+
+    // if the current mode is not valid (e.g. adapter change), ensure it's in the list so the user isn't confused
+    if (!current_fullscreen_mode_found && !current_fullscreen_mode.empty())
+    {
+      const QString qmodename = QtUtils::StringViewToQString(current_fullscreen_mode);
+      m_ui.fullscreenMode->addItem(qmodename, QVariant(qmodename));
+    }
+
+    // disable it if we don't have a choice
+    const bool has_fullscreen_modes = (current_adapter && !current_adapter->fullscreen_modes.empty());
+    const bool has_exclusive_fullscreen_control = (render_api == RenderAPI::Vulkan);
+    m_ui.fullscreenMode->setVisible(has_fullscreen_modes);
+    if (has_fullscreen_modes)
+      SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.fullscreenMode, Settings::GPU_SECTION_NAME,
+                                                     "FullscreenMode");
+    m_ui.exclusiveFullscreenControl->setVisible(has_exclusive_fullscreen_control);
+    m_ui.exclusiveFullscreenLabel->setVisible(has_fullscreen_modes || has_exclusive_fullscreen_control);
+  }
+
+  if (!m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaling))
+  {
+    const int max_scale =
+      static_cast<int>(current_adapter ? std::clamp<u32>(current_adapter->max_texture_size / 1024u, 1u, 32u) : 16);
+    populateAndConnectUpscalingModes(max_scale);
+  }
+
+  {
+    SettingWidgetBinder::DisconnectWidget(m_ui.msaaMode);
+    m_ui.msaaMode->clear();
+
+    const u32 max_multisamples = current_adapter ? current_adapter->max_multisamples : 8;
+    m_ui.msaaMode->addItem(tr("Disabled"), GetMSAAModeValue(1, false));
+    for (uint i = 2; i <= max_multisamples; i *= 2)
+      m_ui.msaaMode->addItem(tr("%1x MSAA").arg(i), GetMSAAModeValue(i, false));
+    for (uint i = 2; i <= max_multisamples; i *= 2)
+      m_ui.msaaMode->addItem(tr("%1x SSAA").arg(i), GetMSAAModeValue(i, true));
+
+    if (m_dialog->isPerGameSettings())
+    {
+      const QVariant global_msaa_mode(
+        GetMSAAModeValue(static_cast<uint>(Core::GetBaseIntSettingValue(Settings::GPU_SECTION_NAME, "Multisamples", 1)),
+                         Core::GetBaseBoolSettingValue(Settings::GPU_SECTION_NAME, "PerSampleShading", false)));
+      const QString global_msaa_string = m_ui.msaaMode->itemText(m_ui.msaaMode->findData(global_msaa_mode));
+      m_ui.msaaMode->insertItem(
+        0, QCoreApplication::translate("SettingWidgetBinder", "Use Global Setting [%1]").arg(global_msaa_string));
+    }
+
+    if (!m_dialog->isPerGameSettings() ||
+        (m_dialog->containsSettingValue(Settings::GPU_SECTION_NAME, "Multisamples") ||
+         m_dialog->containsSettingValue(Settings::GPU_SECTION_NAME, "PerSampleShading")))
+    {
+      const QVariant current_msaa_mode(GetMSAAModeValue(
+        static_cast<uint>(m_dialog->getEffectiveIntValue(Settings::GPU_SECTION_NAME, "Multisamples", 1)),
+        m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "PerSampleShading", false)));
+      const int current_msaa_index = m_ui.msaaMode->findData(current_msaa_mode);
+      if (current_msaa_index >= 0)
+        m_ui.msaaMode->setCurrentIndex(current_msaa_index);
+    }
+    else
+    {
+      m_ui.msaaMode->setCurrentIndex(0);
+    }
+    connect(m_ui.msaaMode, &QComboBox::currentIndexChanged, this, [this]() {
+      const int index = m_ui.msaaMode->currentIndex();
+      if (m_dialog->isPerGameSettings() && index == 0)
+      {
+        m_dialog->removeSettingValue(Settings::GPU_SECTION_NAME, "Multisamples");
+        m_dialog->removeSettingValue(Settings::GPU_SECTION_NAME, "PerSampleShading");
+      }
+      else
+      {
+        uint multisamples;
+        bool ssaa;
+        DecodeMSAAModeValue(m_ui.msaaMode->itemData(index), &multisamples, &ssaa);
+        m_dialog->setIntSettingValue(Settings::GPU_SECTION_NAME, "Multisamples", static_cast<int>(multisamples));
+        m_dialog->setBoolSettingValue(Settings::GPU_SECTION_NAME, "PerSampleShading", ssaa);
+      }
+    });
+  }
+}
+
+void GraphicsSettingsWidget::populateAndConnectUpscalingModes(int max_scale)
+{
+  SettingWidgetBinder::DisconnectWidget(m_ui.resolutionScale);
+  m_ui.resolutionScale->clear();
+
+  populateUpscalingModes(m_ui.resolutionScale, max_scale);
+
+  SettingWidgetBinder::BindWidgetToIntSetting(m_dialog->getSettingsInterface(), m_ui.resolutionScale,
+                                              Settings::GPU_SECTION_NAME, "ResolutionScale", 1);
+  connect(m_ui.resolutionScale, &QComboBox::currentIndexChanged, this,
+          &GraphicsSettingsWidget::updateResolutionDependentOptions);
+
+  m_ui.resolutionScaleWarningIcon->setPixmap(
+    QIcon(QtHost::GetResourceQPath("images/warning.svg", true)).pixmap(16, 16));
+  m_ui.resolutionScaleWarningIcon->setToolTip(
+    tr("PGXP is not enabled. Increasing the resolution without enabling PGXP will result in visible polygon "
+       "glitches."));
+}
+
+void GraphicsSettingsWidget::populateUpscalingModes(QComboBox* const cb, int max_scale)
+{
+  static constexpr const std::pair<int, const char*> templates[] = {
+    {0, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "Automatic (Based on Window Size)")},
+    {1, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "1x Native (Default)")},
+    {3, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "3x Native (for 720p)")},
+    {5, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "5x Native (for 1080p)")},
+    {6, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "6x Native (for 1440p)")},
+    {9, QT_TRANSLATE_NOOP("GraphicsSettingsWidget", "9x Native (for 4K)")},
+  };
+  for (int scale = 0; scale <= max_scale; scale++)
+  {
+    const auto it = std::find_if(std::begin(templates), std::end(templates),
+                                 [&scale](const std::pair<int, const char*>& it) { return scale == it.first; });
+    cb->addItem((it != std::end(templates)) ?
+                  QCoreApplication::translate("GraphicsSettingsWidget", it->second) :
+                  QCoreApplication::translate("GraphicsSettingsWidget", "%1x Native").arg(scale));
+  }
+}
+
+QVariant GraphicsSettingsWidget::packAspectRatio(DisplayAspectRatio ar)
+{
+  return QVariant(static_cast<uint>(ar.numerator) << 16 | static_cast<uint>(ar.denominator));
+}
+
+DisplayAspectRatio GraphicsSettingsWidget::unpackAspectRatio(const QVariant& var)
+{
+  const uint packed = var.toUInt();
+  return DisplayAspectRatio{static_cast<s16>(packed >> 16), static_cast<s16>(packed & 0xFFFFu)};
+}
+
+void GraphicsSettingsWidget::createAspectRatioSetting(QComboBox* const cb, QSpinBox* const numerator,
+                                                      QLabel* const separator, QSpinBox* const denominator,
+                                                      SettingsInterface* const sif)
+{
+  static constexpr const char* CONFIG_KEY = "AspectRatio";
+
+  // AR requires special handling because of the custom option.
+  if (sif)
+  {
+    cb->addItem(
+      QCoreApplication::translate("SettingWidgetBinder", "Use Global Setting [%1]")
+        .arg(QtUtils::StringViewToQString(Settings::GetDisplayAspectRatioDisplayName(
+          Settings::ParseDisplayAspectRatio(Core::GetBaseStringSettingValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY))
+            .value_or(Settings::DEFAULT_DISPLAY_ASPECT_RATIO)))));
+  }
+  for (const DisplayAspectRatio& ratio : Settings::GetPredefinedDisplayAspectRatios())
+  {
+    cb->addItem(QtUtils::StringViewToQString(Settings::GetDisplayAspectRatioDisplayName(ratio)),
+                packAspectRatio(ratio));
+  }
+  cb->addItem(tr("Custom"));
+
+  bool is_custom_ar = false;
+  if (sif && !sif->ContainsValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY))
+  {
+    cb->setCurrentIndex(0);
+  }
+  else
+  {
+    const DisplayAspectRatio ar = Settings::ParseDisplayAspectRatio(
+                                    sif ? sif->GetStringValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY) :
+                                          Core::GetBaseStringSettingValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY))
+                                    .value_or(Settings::DEFAULT_DISPLAY_ASPECT_RATIO);
+    if ((is_custom_ar = std::ranges::none_of(Settings::GetPredefinedDisplayAspectRatios(),
+                                             [&ar](const auto& it) { return (it == ar); })))
+    {
+      cb->setCurrentIndex(cb->count() - 1);
+      numerator->setValue(ar.numerator);
+      denominator->setValue(ar.denominator);
+    }
+    else
+    {
+      cb->setCurrentIndex(cb->findData(packAspectRatio(ar)));
+    }
+  }
+  numerator->setVisible(is_custom_ar);
+  separator->setVisible(is_custom_ar);
+  denominator->setVisible(is_custom_ar);
+
+  auto value_changed = [cb, numerator, separator, denominator, sif]() {
+    std::optional<DisplayAspectRatio> value_to_save;
+    const int index = cb->currentIndex();
+    bool is_custom = false;
+    if (!sif || index > 0)
+    {
+      if (index == (cb->count() - 1))
+      {
+        is_custom = true;
+        value_to_save.emplace(static_cast<s16>(numerator->value()), static_cast<s16>(denominator->value()));
+      }
+      else
+      {
+        value_to_save.emplace(unpackAspectRatio(cb->currentData()));
+      }
+    }
+
+    numerator->setVisible(is_custom);
+    denominator->setVisible(is_custom);
+    separator->setVisible(is_custom);
+
+    if (sif)
+    {
+      if (value_to_save.has_value())
+      {
+        sif->SetStringValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY,
+                            Settings::GetDisplayAspectRatioName(value_to_save.value()).c_str());
+      }
+      else
+      {
+        sif->DeleteValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY);
+      }
+
+      QtHost::SaveSettingsInterface(sif, true, true);
+    }
+    else
+    {
+      if (value_to_save.has_value())
+      {
+        Core::SetBaseStringSettingValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY,
+                                        Settings::GetDisplayAspectRatioName(value_to_save.value()).c_str());
+      }
+      else
+      {
+        Core::DeleteBaseSettingValue(Settings::DISPLAY_SECTION_NAME, CONFIG_KEY);
+      }
+
+      Host::CommitBaseSettingChanges();
+      g_core_thread->applySettings();
+    }
+  };
+
+  connect(cb, &QComboBox::currentIndexChanged, cb, value_changed);
+  connect(numerator, &QSpinBox::valueChanged, cb, value_changed);
+  connect(denominator, &QSpinBox::valueChanged, cb, std::move(value_changed));
+}
+
+void GraphicsSettingsWidget::updatePGXPSettingsEnabled()
+{
+  const bool enabled = (effectiveRendererIsHardware() &&
+                        m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "PGXPEnable", false) &&
+                        !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXP));
+  const bool tc_enabled =
+    (enabled && m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "PGXPTextureCorrection", true));
+  const bool depth_enabled =
+    (enabled && m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "PGXPDepthBuffer", false));
+  m_ui.tabs->setTabEnabled(TAB_INDEX_PGXP, enabled);
+  m_ui.pgxpTab->setEnabled(enabled);
+  m_ui.pgxpCulling->setEnabled(enabled && !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPCulling));
+  m_ui.pgxpTextureCorrection->setEnabled(enabled &&
+                                         !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPTextureCorrection));
+  m_ui.pgxpColorCorrection->setEnabled(tc_enabled &&
+                                       !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPColorCorrection));
+  m_ui.pgxpDepthBuffer->setEnabled(enabled && !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPDepthBuffer));
+  const GameDatabase::Entry* dbentry = m_dialog->getDatabaseEntry();
+  m_ui.pgxpPreserveProjPrecision->setEnabled(
+    enabled && (!dbentry || !dbentry->gpu_pgxp_preserve_proj_fp.has_value(dbentry->override_mask)));
+  m_ui.pgxpCPU->setEnabled(enabled);
+  m_ui.pgxpCPULabel->setEnabled(enabled);
+  m_ui.pgxpVertexCache->setEnabled(enabled);
+  m_ui.pgxpVertexCacheLabel->setEnabled(enabled);
+  m_ui.pgxpGeometryTolerance->setEnabled(enabled);
+  m_ui.pgxpGeometryToleranceLabel->setEnabled(enabled);
+  m_ui.resetPGXPGeometryTolerance->setEnabled(enabled);
+  m_ui.pgxpDepthClearThreshold->setEnabled(depth_enabled);
+  m_ui.pgxpDepthClearThresholdLabel->setEnabled(depth_enabled);
+  m_ui.resetPGXPDepthClearThreshold->setEnabled(depth_enabled);
+  m_ui.pgxpDepthBias->setEnabled(depth_enabled);
+  m_ui.pgxpDepthBiasLabel->setEnabled(depth_enabled);
+  m_ui.resetPGXPDepthBias->setEnabled(depth_enabled);
+  m_ui.pgxpDisableOn2DPolygons->setEnabled(enabled &&
+                                           !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXPOn2DPolygons));
+  m_ui.pgxpTransparentDepthTest->setEnabled(depth_enabled);
+  m_ui.pgxpNormalizeDepth->setEnabled(depth_enabled &&
+                                      !m_dialog->hasGameTrait(GameDatabase::Trait::NormalizePGXPDepth));
+  updateResolutionDependentOptions();
+}
+
+void GraphicsSettingsWidget::updateResolutionDependentOptions()
+{
+  const bool is_hardware = (getEffectiveRenderer() != GPURenderer::Software);
+  const int scale = m_dialog->getEffectiveIntValue(Settings::GPU_SECTION_NAME, "ResolutionScale", 1);
+  const bool pgxp_enabled =
+    (is_hardware && m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "PGXPEnable", false) &&
+     !m_dialog->hasGameTrait(GameDatabase::Trait::DisablePGXP));
+  const GPUTextureFilter texture_filtering =
+    Settings::ParseTextureFilterName(
+      m_dialog->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "TextureFilter").c_str())
+      .value_or(Settings::DEFAULT_GPU_TEXTURE_FILTER);
+  const GPUTextureFilter sprite_texture_filtering =
+    Settings::ParseTextureFilterName(
+      m_dialog->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "SpriteTextureFilter").c_str())
+      .value_or(Settings::DEFAULT_GPU_TEXTURE_FILTER);
+  m_ui.forceRoundedTexcoords->setEnabled(
+    is_hardware && scale != 1 && texture_filtering == GPUTextureFilter::Nearest &&
+    !m_dialog->hasGameTrait(GameDatabase::Trait::ForceRoundUpscaledTextureCoordinates));
+  m_ui.disableUpscaledDirectTextures->setEnabled(
+    is_hardware && scale != 1 && !m_dialog->hasGameTrait(GameDatabase::Trait::DisableUpscaledDirectTextures));
+  const bool filter_framebuffer_uploads_available =
+    (is_hardware && scale != 1 && sprite_texture_filtering != GPUTextureFilter::Nearest);
+  m_ui.filterFramebufferUploads->setEnabled(filter_framebuffer_uploads_available &&
+                                            !m_dialog->hasGameTrait(GameDatabase::Trait::FilterFramebufferUploads));
+  const bool filter_framebuffer_upload_sizes_enabled =
+    (filter_framebuffer_uploads_available && m_ui.filterFramebufferUploads->isChecked());
+  m_ui.filterFramebufferUploadsMinimumSizeLabel->setEnabled(filter_framebuffer_upload_sizes_enabled);
+  m_ui.filterFramebufferUploadsMinimumWidth->setEnabled(filter_framebuffer_upload_sizes_enabled);
+  m_ui.filterFramebufferUploadsMinimumSizeSeparatorLabel->setEnabled(filter_framebuffer_upload_sizes_enabled);
+  m_ui.filterFramebufferUploadsMinimumHeight->setEnabled(filter_framebuffer_upload_sizes_enabled);
+  m_ui.resolutionScaleWarningIcon->setVisible(scale != 1 && !pgxp_enabled);
+}
+
+void GraphicsSettingsWidget::warnAboutRendererChange()
+{
+  if (m_ui.renderer->currentIndex() == 0 ||
+      Core::GetBaseBoolSettingValue(Settings::UI_SECTION_NAME, "RendererWarningShown", false) || !isVisible())
+  {
+    updateResolutionDependentOptions();
+    return;
+  }
+
+  // Revert the setting back to automatic. Need to do this before the normal handler executes.
+  const int user_selected_index = m_ui.renderer->currentIndex();
+  {
+    const QSignalBlocker sb(m_ui.renderer);
+    m_ui.renderer->setCurrentIndex(0);
+  }
+
+  QMessageBox* const msgbox = QtUtils::NewMessageBox(
+    this, QMessageBox::Warning, m_dialog->windowTitle(),
+    tr("<h3>Changing the renderer is not recommended!</h3><p>The <strong>Automatic</strong> option provides the best "
+       "experience, selecting the optimal renderer for your graphics adapter. There is <strong>no visual or "
+       "performance advantage</strong> to using a different renderer, and you risk the application breaking due to "
+       "driver bugs.<br><br>If you continue with changing the renderer, <strong>do not ask for "
+       "support</strong>.<br><br>Are you sure you want to change the renderer?</p>"),
+    QMessageBox::Yes | QMessageBox::No);
+  msgbox->setDefaultButton(QMessageBox::No);
+  msgbox->connect(msgbox, &QMessageBox::accepted, this, [this, user_selected_index]() {
+    Core::SetBaseBoolSettingValue(Settings::UI_SECTION_NAME, "RendererWarningShown", true);
+    m_ui.renderer->setCurrentIndex(user_selected_index);
+  });
+  msgbox->open();
+}
+
+void GraphicsSettingsWidget::onDownsampleModeChanged()
+{
+  const GPUDownsampleMode mode =
+    Settings::ParseDownsampleModeName(
+      m_dialog
+        ->getEffectiveStringValue(Settings::GPU_SECTION_NAME, "DownsampleMode",
+                                  Settings::GetDownsampleModeName(Settings::DEFAULT_GPU_DOWNSAMPLE_MODE))
+        .c_str())
+      .value_or(Settings::DEFAULT_GPU_DOWNSAMPLE_MODE);
+
+  const bool visible = (mode == GPUDownsampleMode::Box);
+  if (visible && m_ui.gpuDownsampleLayout->indexOf(m_ui.gpuDownsampleScale) < 0)
+  {
+    m_ui.gpuDownsampleScale->setVisible(true);
+    m_ui.gpuDownsampleLayout->addWidget(m_ui.gpuDownsampleScale, 0);
+  }
+  else if (!visible && m_ui.gpuDownsampleLayout->indexOf(m_ui.gpuDownsampleScale) >= 0)
+  {
+    m_ui.gpuDownsampleScale->setVisible(false);
+    m_ui.gpuDownsampleLayout->removeWidget(m_ui.gpuDownsampleScale);
+  }
+}
+
+void GraphicsSettingsWidget::onFineCropModeChanged()
+{
+  const DisplayFineCropMode mode =
+    Settings::ParseDisplayFineCropMode(
+      m_dialog->getEffectiveStringValue(Settings::DISPLAY_SECTION_NAME, "FineCropMode", "").c_str())
+      .value_or(Settings::DEFAULT_DISPLAY_FINE_CROP_MODE);
+  const bool enabled = (mode != DisplayFineCropMode::None);
+  m_ui.displayFineCropLabel->setEnabled(enabled);
+  m_ui.displayFineCropLeftLabel->setEnabled(enabled);
+  m_ui.displayFineCropLeft->setEnabled(enabled);
+  m_ui.displayFineCropTopLabel->setEnabled(enabled);
+  m_ui.displayFineCropTop->setEnabled(enabled);
+  m_ui.displayFineCropRightLabel->setEnabled(enabled);
+  m_ui.displayFineCropRight->setEnabled(enabled);
+  m_ui.displayFineCropBottomLabel->setEnabled(enabled);
+  m_ui.displayFineCropBottom->setEnabled(enabled);
+}
+
+void GraphicsSettingsWidget::onFineCropResetClicked()
+{
+  if (m_dialog->isPerGameSettings())
+  {
+    // Super nasty.. need to set the default without the signal firing and writing the global value to the ini...
+    const auto reset = [this]<typename T>(T* widget, const char* key) {
+      const QSignalBlocker sb(widget);
+      if constexpr (std::is_same_v<T, QComboBox>)
+        SettingWidgetBinder::SettingAccessor<T>::setNullableStringValue(widget, std::nullopt);
+      else
+        SettingWidgetBinder::SettingAccessor<QSpinBox>::setNullableIntValue(widget, std::nullopt);
+
+      m_dialog->removeSettingValue(Settings::DISPLAY_SECTION_NAME, key);
+    };
+
+    reset(m_ui.displayFineCropMode, "FineCropMode");
+    reset(m_ui.displayFineCropLeft, "FineCropLeft");
+    reset(m_ui.displayFineCropTop, "FineCropTop");
+    reset(m_ui.displayFineCropRight, "FineCropRight");
+    reset(m_ui.displayFineCropBottom, "FineCropBottom");
+  }
+  else
+  {
+    m_ui.displayFineCropMode->setCurrentIndex(0);
+    m_ui.displayFineCropLeft->setValue(0);
+    m_ui.displayFineCropTop->setValue(0);
+    m_ui.displayFineCropRight->setValue(0);
+    m_ui.displayFineCropBottom->setValue(0);
+  }
+}
+
+void GraphicsSettingsWidget::onResetPGXPGeometryToleranceClicked()
+{
+  m_dialog->setFloatSettingValue(Settings::GPU_SECTION_NAME, "PGXPTolerance",
+                                 m_dialog->isPerGameSettings() ? std::nullopt : std::make_optional(-1.0f));
+  SettingWidgetBinder::DisconnectWidget(m_ui.pgxpGeometryTolerance);
+  SettingWidgetBinder::BindWidgetToFloatSetting(m_dialog->getSettingsInterface(), m_ui.pgxpGeometryTolerance,
+                                                Settings::GPU_SECTION_NAME, "PGXPTolerance", -1.0f);
+}
+
+void GraphicsSettingsWidget::onResetPGXPDepthClearThresholdClicked()
+{
+  m_dialog->setFloatSettingValue(
+    Settings::GPU_SECTION_NAME, "PGXPDepthThreshold",
+    m_dialog->isPerGameSettings() ? std::nullopt : std::make_optional(Settings::DEFAULT_GPU_PGXP_DEPTH_THRESHOLD));
+  SettingWidgetBinder::DisconnectWidget(m_ui.pgxpDepthClearThreshold);
+  SettingWidgetBinder::BindWidgetToFloatSetting(m_dialog->getSettingsInterface(), m_ui.pgxpDepthClearThreshold,
+                                                Settings::GPU_SECTION_NAME, "PGXPDepthThreshold",
+                                                Settings::DEFAULT_GPU_PGXP_DEPTH_THRESHOLD);
+}
+
+void GraphicsSettingsWidget::onResetPGXPDepthBiasClicked()
+{
+  m_dialog->setFloatSettingValue(
+    Settings::GPU_SECTION_NAME, "PGXPDepthBias",
+    m_dialog->isPerGameSettings() ? std::nullopt : std::make_optional(Settings::DEFAULT_GPU_PGXP_DEPTH_BIAS));
+  SettingWidgetBinder::DisconnectWidget(m_ui.pgxpDepthBias);
+  SettingWidgetBinder::BindWidgetToFloatSetting(m_dialog->getSettingsInterface(), m_ui.pgxpDepthBias,
+                                                Settings::GPU_SECTION_NAME, "PGXPDepthBias",
+                                                Settings::DEFAULT_GPU_PGXP_DEPTH_BIAS);
+}
+
+void GraphicsSettingsWidget::onEnableTextureCacheChanged()
+{
+  const bool tc_enabled = m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "EnableTextureCache", false);
+  m_ui.enableTextureReplacements->setEnabled(tc_enabled);
+  m_ui.enableTextureDumping->setEnabled(tc_enabled);
+  m_ui.alwaysTrackUploads->setEnabled(tc_enabled);
+  onEnableAnyTextureDumpingChanged();
+  onEnableAnyTextureReplacementsChanged();
+}
+
+void GraphicsSettingsWidget::onEnableAnyTextureDumpingChanged()
+{
+  const bool tc_enabled = m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "EnableTextureCache", false);
+  const bool dumping_enabled =
+    (tc_enabled && m_dialog->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTextures", false));
+  const bool background_dumping_enabled =
+    m_dialog->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpVRAMWrites", false);
+  const bool any_dumping_enabled = (dumping_enabled || background_dumping_enabled);
+  m_ui.dumpReplacedTextures->setEnabled(any_dumping_enabled);
+}
+
+void GraphicsSettingsWidget::onEnableAnyTextureReplacementsChanged()
+{
+  const bool any_replacements_enabled =
+    (m_dialog->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "EnableVRAMWriteReplacements",
+                                     false) ||
+     (m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "EnableTextureCache", false) &&
+      m_dialog->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "EnableTextureReplacements",
+                                      false)));
+  m_ui.preloadTextureReplacements->setEnabled(any_replacements_enabled);
+}
+
+void GraphicsSettingsWidget::onGPUThreadChanged()
+{
+  const bool enabled = m_dialog->getEffectiveBoolValue(Settings::GPU_SECTION_NAME, "UseThread", true);
+  m_ui.maxQueuedFrames->setEnabled(enabled);
+  m_ui.maxQueuedFramesLabel->setEnabled(enabled);
+}
+
+TextureReplacementSettingsDialog::TextureReplacementSettingsDialog(SettingsWindow* settings_window, QWidget* parent)
+  : QDialog(parent)
+{
+  m_ui.setupUi(this);
+  QtUtils::FixSpinBoxTextMargins(this);
+  m_ui.icon->setPixmap(QIcon(u":/icons/monochrome/svg/image-fill.svg"_s).pixmap(32));
+
+  constexpr Settings::TextureReplacementSettings::Configuration default_replacement_config;
+  SettingsInterface* const sif = settings_window->getSettingsInterface();
+
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.dumpTexturePages, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME,
+                                               "DumpTexturePages", default_replacement_config.dump_texture_pages);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.dumpFullTexturePages,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpFullTexturePages",
+                                               default_replacement_config.dump_full_texture_pages);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.dumpC16Textures, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME,
+                                               "DumpC16Textures", default_replacement_config.dump_c16_textures);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.reducePaletteRange,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "ReducePaletteRange",
+                                               default_replacement_config.reduce_palette_range);
+  SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.convertCopiesToWrites,
+                                               Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "ConvertCopiesToWrites",
+                                               default_replacement_config.convert_copies_to_writes);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.replacementScaleLinearFilter, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "ReplacementScaleLinearFilter",
+    default_replacement_config.replacement_scale_linear_filter);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.maxVRAMWriteSplits, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME,
+                                              "MaxVRAMWriteSplits", default_replacement_config.max_vram_write_splits);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.maxVRAMWriteCoalesceWidth,
+                                              Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "MaxVRAMWriteCoalesceWidth",
+                                              default_replacement_config.max_vram_write_coalesce_width);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.maxVRAMWriteCoalesceHeight,
+                                              Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "MaxVRAMWriteCoalesceHeight",
+                                              default_replacement_config.max_vram_write_coalesce_height);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.minDumpedTextureWidth,
+                                              Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTextureWidthThreshold",
+                                              default_replacement_config.texture_dump_width_threshold);
+  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.minDumpedTextureHeight,
+                                              Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTextureHeightThreshold",
+                                              default_replacement_config.texture_dump_height_threshold);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.setTextureDumpAlphaChannel, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTextureForceAlphaChannel",
+    default_replacement_config.dump_texture_force_alpha_channel);
+
+  SettingWidgetBinder::BindWidgetToIntSetting(
+    sif, m_ui.minDumpedVRAMWriteWidth, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpVRAMWriteWidthThreshold",
+    default_replacement_config.vram_write_dump_width_threshold);
+  SettingWidgetBinder::BindWidgetToIntSetting(
+    sif, m_ui.minDumpedVRAMWriteHeight, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpVRAMWriteHeightThreshold",
+    default_replacement_config.vram_write_dump_height_threshold);
+  SettingWidgetBinder::BindWidgetToBoolSetting(
+    sif, m_ui.setVRAMWriteAlphaChannel, Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpVRAMWriteForceAlphaChannel",
+    default_replacement_config.dump_vram_write_force_alpha_channel);
+
+  m_ui.dumpFullTexturePages->setEnabled(
+    settings_window->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTexturePages", false));
+  connect(m_ui.dumpTexturePages, &QCheckBox::checkStateChanged, this, [this, settings_window] {
+    m_ui.dumpFullTexturePages->setEnabled(
+      settings_window->getEffectiveBoolValue(Settings::TEXTURE_REPLACEMENTS_SECTION_NAME, "DumpTexturePages", false));
+  });
+  connect(m_ui.closeButton, &QAbstractButton::clicked, this, &QDialog::accept);
+  connect(m_ui.exportButton, &QAbstractButton::clicked, this, &TextureReplacementSettingsDialog::onExportClicked);
+}
+
+void TextureReplacementSettingsDialog::onExportClicked()
+{
+  Settings::TextureReplacementSettings::Configuration config;
+
+  config.dump_texture_pages = m_ui.dumpTexturePages->isChecked();
+  config.dump_full_texture_pages = m_ui.dumpFullTexturePages->isChecked();
+  config.dump_c16_textures = m_ui.dumpC16Textures->isChecked();
+  config.reduce_palette_range = m_ui.reducePaletteRange->isChecked();
+  config.convert_copies_to_writes = m_ui.convertCopiesToWrites->isChecked();
+  config.replacement_scale_linear_filter = m_ui.replacementScaleLinearFilter->isChecked();
+  config.max_vram_write_splits = static_cast<u16>(m_ui.maxVRAMWriteSplits->value());
+  config.max_vram_write_coalesce_width = static_cast<u16>(m_ui.maxVRAMWriteCoalesceWidth->value());
+  config.max_vram_write_coalesce_height = static_cast<u16>(m_ui.maxVRAMWriteCoalesceHeight->value());
+  config.texture_dump_width_threshold = static_cast<u16>(m_ui.minDumpedTextureWidth->value());
+  config.texture_dump_height_threshold = static_cast<u16>(m_ui.minDumpedTextureHeight->value());
+  config.dump_texture_force_alpha_channel = m_ui.setTextureDumpAlphaChannel->isChecked();
+  config.vram_write_dump_width_threshold = static_cast<u16>(m_ui.minDumpedVRAMWriteWidth->value());
+  config.vram_write_dump_height_threshold = static_cast<u16>(m_ui.minDumpedVRAMWriteHeight->value());
+  config.dump_vram_write_force_alpha_channel = m_ui.setVRAMWriteAlphaChannel->isChecked();
+
+  QInputDialog* const idlg = new QInputDialog(this);
+  idlg->resize(600, 400);
+  idlg->setWindowTitle(tr("Texture Replacement Configuration"));
+  idlg->setInputMode(QInputDialog::TextInput);
+  idlg->setOption(QInputDialog::UsePlainTextEditForTextInput);
+  idlg->setLabelText(tr("Texture Replacement Configuration (config.yaml)"));
+  idlg->setTextValue(QString::fromStdString(config.ExportToYAML(false)));
+  idlg->setOkButtonText(tr("Save As..."));
+  connect(idlg, &QDialog::accepted, [this, idlg]() {
+    const QString path =
+      QFileDialog::getSaveFileName(this, tr("Save Configuration"), QString(), tr("Configuration Files (config.yaml)"));
+    if (path.isEmpty())
+      return;
+
+    Error error;
+    if (!FileSystem::WriteStringToFile(QDir::toNativeSeparators(path).toUtf8().constData(),
+                                       idlg->textValue().toStdString(), &error))
+    {
+      QtUtils::AsyncMessageBox(this, QMessageBox::Critical, tr("Write Failed"),
+                               QString::fromStdString(error.GetDescription()));
+    }
+  });
+  idlg->open();
+}
+
+void GraphicsSettingsWidget::onTextureReplacementOptionsClicked()
+{
+  QDialog* const dlg = new TextureReplacementSettingsDialog(m_dialog, this);
+  dlg->setAttribute(Qt::WA_DeleteOnClose);
+  dlg->open();
+}

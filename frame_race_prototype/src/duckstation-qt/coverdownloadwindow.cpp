@@ -1,0 +1,125 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "coverdownloadwindow.h"
+#include "gamelistwidget.h"
+#include "mainwindow.h"
+#include "qthost.h"
+#include "qtprogresscallback.h"
+
+#include "core/core.h"
+#include "core/game_list.h"
+
+#include "common/error.h"
+#include "common/string_util.h"
+
+#include "moc_coverdownloadwindow.cpp"
+
+using namespace Qt::StringLiterals;
+
+CoverDownloadWindow::CoverDownloadWindow() : QWidget()
+{
+  m_ui.setupUi(this);
+  m_ui.coverIcon->setPixmap(QIcon(u":/icons/monochrome/svg/artboard-2-line.svg"_s).pixmap(32));
+  updateEnabled();
+
+  connect(m_ui.start, &QPushButton::clicked, this, &CoverDownloadWindow::onStartClicked);
+  connect(m_ui.close, &QPushButton::clicked, this, &CoverDownloadWindow::close);
+  connect(m_ui.urls, &QPlainTextEdit::textChanged, this, &CoverDownloadWindow::updateEnabled);
+
+  const std::vector<std::string> urls = Core::GetBaseStringListSetting(Settings::UI_SECTION_NAME, "CoverDownloaderURL");
+  if (!urls.empty())
+    m_ui.urls->setPlainText(QString::fromStdString(StringUtil::JoinString(urls, "\n")));
+
+  m_ui.useSerialFileNames->setChecked(
+    Core::GetBaseBoolSettingValue(Settings::UI_SECTION_NAME, "CoverDownloaderUseSerialFileNames", false));
+}
+
+CoverDownloadWindow::~CoverDownloadWindow() = default;
+
+void CoverDownloadWindow::closeEvent(QCloseEvent* ev)
+{
+  std::vector<std::string> urls;
+  for (const QString& str : m_ui.urls->toPlainText().split(QChar('\n')))
+  {
+    std::string url = str.toStdString();
+    StringUtil::StripWhitespace(&url);
+    if (!url.empty())
+      urls.push_back(std::move(url));
+  }
+
+  bool changed = (urls != Core::GetBaseStringListSetting(Settings::UI_SECTION_NAME, "CoverDownloaderURL"));
+  if (changed)
+    Core::SetBaseStringListSettingValue(Settings::UI_SECTION_NAME, "CoverDownloaderURL", urls);
+  if (const bool use_serial_filenames = m_ui.useSerialFileNames->isChecked();
+      use_serial_filenames !=
+      Core::GetBaseBoolSettingValue(Settings::UI_SECTION_NAME, "CoverDownloaderUseSerialFileNames", false))
+  {
+    Core::SetBaseBoolSettingValue(Settings::UI_SECTION_NAME, "CoverDownloaderUseSerialFileNames", use_serial_filenames);
+    changed = true;
+  }
+  if (changed)
+    Host::CommitBaseSettingChanges();
+
+  QtUtils::SaveWindowGeometry(this);
+  QWidget::closeEvent(ev);
+  if (m_task)
+    m_task->cancel();
+  emit closed();
+}
+
+void CoverDownloadWindow::onStartClicked()
+{
+  if (m_task)
+  {
+    m_task->cancel();
+    return;
+  }
+
+  std::vector<std::string> urls;
+  const bool use_serials = m_ui.useSerialFileNames->isChecked();
+  for (const QString& str : m_ui.urls->toPlainText().split(QChar('\n')))
+    urls.push_back(str.toStdString());
+
+  m_task = QtAsyncTaskWithProgress::create(
+    this, [this, urls = std::move(urls), use_serials](ProgressCallback* const progress) {
+      Error error;
+      const bool result = GameList::DownloadCovers(
+        urls, use_serials, progress, &error, [](const GameList::Entry* entry, std::string) mutable {
+          Host::RunOnUIThread([path = entry->path]() {
+            g_main_window->getGameListWidget()->getModel()->invalidateColumnForPath(path, GameListModel::Column_Cover);
+          });
+        });
+      return [this, result, error = std::move(error)]() { downloadComplete(result, error); };
+    });
+
+  m_task->connectWidgets(m_ui.status, m_ui.progress, m_ui.start);
+
+  m_task->start();
+
+  updateEnabled();
+}
+
+void CoverDownloadWindow::downloadComplete(bool result, const Error& error)
+{
+  g_main_window->getGameListWidget()->getModel()->invalidateColumn(GameListModel::Column_Cover);
+
+  m_ui.status->setText(tr("Download complete."));
+  if (!result)
+  {
+    if (const std::string& err_str = error.GetDescription(); !err_str.empty())
+      m_ui.status->setText(QString::fromStdString(err_str));
+  }
+
+  m_task = nullptr;
+  updateEnabled();
+}
+
+void CoverDownloadWindow::updateEnabled()
+{
+  const bool running = static_cast<bool>(m_task);
+  m_ui.start->setText(running ? tr("Stop") : tr("Start"));
+  m_ui.start->setEnabled(running || !m_ui.urls->toPlainText().isEmpty());
+  m_ui.close->setEnabled(!running);
+  m_ui.urls->setEnabled(!running);
+}

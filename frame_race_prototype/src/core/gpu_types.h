@@ -1,0 +1,272 @@
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#pragma once
+
+#include "common/bitfield.h"
+#include "common/bitutils.h"
+#include "common/types.h"
+
+enum : u32
+{
+  VRAM_WIDTH = 1024,
+  VRAM_HEIGHT = 512,
+  VRAM_SIZE = VRAM_WIDTH * VRAM_HEIGHT * sizeof(u16),
+  VRAM_WIDTH_MASK = VRAM_WIDTH - 1,
+  VRAM_HEIGHT_MASK = VRAM_HEIGHT - 1,
+  TEXTURE_PAGE_WIDTH = 256,
+  TEXTURE_PAGE_HEIGHT = 256,
+  GPU_CLUT_SIZE = 256,
+
+  // In interlaced modes, we can exceed the 512 height of VRAM, up to 576 in PAL games.
+  GPU_MAX_DISPLAY_WIDTH = 720,
+  GPU_MAX_DISPLAY_HEIGHT = 576,
+
+  DITHER_MATRIX_SIZE = 4,
+
+  VRAM_PAGE_WIDTH = 64,
+  VRAM_PAGE_HEIGHT = 256,
+  VRAM_PAGES_WIDE = VRAM_WIDTH / VRAM_PAGE_WIDTH,
+  VRAM_PAGES_HIGH = VRAM_HEIGHT / VRAM_PAGE_HEIGHT,
+  VRAM_PAGE_X_MASK = 0xf,  // 16 pages wide
+  VRAM_PAGE_Y_MASK = 0x10, // 2 pages high
+  NUM_VRAM_PAGES = VRAM_PAGES_WIDE * VRAM_PAGES_HIGH,
+};
+
+enum : s32
+{
+  MAX_PRIMITIVE_WIDTH = 1024,
+  MAX_PRIMITIVE_HEIGHT = 512,
+};
+
+enum class GPUDMADirection : u8
+{
+  Off = 0,
+  FIFO = 1,
+  CPUtoGP0 = 2,
+  GPUREADtoCPU = 3
+};
+
+enum class GPUPrimitive : u8
+{
+  Reserved = 0,
+  Polygon = 1,
+  Line = 2,
+  Rectangle = 3
+};
+
+enum class GPUDrawRectangleSize : u8
+{
+  Variable = 0,
+  R1x1 = 1,
+  R8x8 = 2,
+  R16x16 = 3
+};
+
+enum class GPUTextureMode : u8
+{
+  Palette4Bit = 0,
+  Palette8Bit = 1,
+  Direct16Bit = 2,
+  Reserved_Direct16Bit = 3, // Not used.
+};
+
+IMPLEMENT_ENUM_CLASS_BITWISE_OPERATORS(GPUTextureMode);
+
+enum class GPUTransparencyMode : u8
+{
+  HalfBackgroundPlusHalfForeground = 0,
+  BackgroundPlusForeground = 1,
+  BackgroundMinusForeground = 2,
+  BackgroundPlusQuarterForeground = 3,
+
+  Disabled = 4 // Not a register value
+};
+
+enum class GPUInterlacedDisplayMode : u8
+{
+  None,
+  InterleavedFields,
+  SeparateFields
+};
+
+enum class GP1Command : u8
+{
+  ResetGPU = 0x00,
+  ClearFIFO = 0x01,
+  AcknowledgeInterrupt = 0x02,
+  SetDisplayDisable = 0x03,
+  SetDMADirection = 0x04,
+  SetDisplayStartAddress = 0x05,
+  SetHorizontalDisplayRange = 0x06,
+  SetVerticalDisplayRange = 0x07,
+  SetDisplayMode = 0x08,
+  SetVRAMSize = 0x09,
+};
+
+// NOTE: Inclusive, not exclusive on the upper bounds.
+struct GPUDrawingArea
+{
+  u32 left;
+  u32 top;
+  u32 right;
+  u32 bottom;
+};
+
+struct GPUDrawingOffset
+{
+  s32 x;
+  s32 y;
+};
+
+union GPURenderCommand
+{
+  u32 bits;
+
+  BitField<u32, u32, 0, 24> color_for_first_vertex;
+  BitField<u32, bool, 24, 1> raw_texture_enable; // not valid for lines
+  BitField<u32, bool, 25, 1> transparency_enable;
+  BitField<u32, bool, 26, 1> texture_enable;
+  BitField<u32, GPUDrawRectangleSize, 27, 2> rectangle_size; // only for rectangles
+  BitField<u32, bool, 27, 1> quad_polygon;                   // only for polygons
+  BitField<u32, bool, 27, 1> polyline;                       // only for lines
+  BitField<u32, bool, 28, 1> shading_enable;                 // 0 - flat, 1 = gouraud
+  BitField<u32, GPUPrimitive, 29, 3> primitive;
+};
+
+union GP1SetDisplayMode
+{
+  u32 bits;
+
+  BitField<u32, u8, 0, 2> horizontal_resolution_1;
+  BitField<u32, bool, 2, 1> vertical_resolution;
+  BitField<u32, bool, 3, 1> pal_mode;
+  BitField<u32, bool, 4, 1> display_area_color_depth;
+  BitField<u32, bool, 5, 1> vertical_interlace;
+  BitField<u32, bool, 6, 1> horizontal_resolution_2;
+  BitField<u32, bool, 7, 1> reverse_flag;
+};
+
+union GPUSTATReg
+{
+  // During transfer/render operations, if ((dst_pixel & mask_and) == 0) { pixel = src_pixel | mask_or }
+
+  u32 bits;
+  BitField<u32, u8, 0, 4> texture_page_x_base;
+  BitField<u32, u8, 4, 1> texture_page_y_base;
+  BitField<u32, GPUTransparencyMode, 5, 2> semi_transparency_mode;
+  BitField<u32, GPUTextureMode, 7, 2> texture_color_mode;
+  BitField<u32, bool, 9, 1> dither_enable;
+  BitField<u32, bool, 10, 1> draw_to_displayed_field;
+  BitField<u32, bool, 11, 1> set_mask_while_drawing;
+  BitField<u32, bool, 12, 1> check_mask_before_draw;
+  BitField<u32, u8, 13, 1> interlaced_field;
+  BitField<u32, bool, 14, 1> reverse_flag;
+  BitField<u32, bool, 15, 1> texture_page_y_base_2;
+  BitField<u32, u8, 16, 1> horizontal_resolution_2;
+  BitField<u32, u8, 17, 2> horizontal_resolution_1;
+  BitField<u32, bool, 19, 1> vertical_resolution;
+  BitField<u32, bool, 20, 1> pal_mode;
+  BitField<u32, bool, 21, 1> display_area_color_depth_24;
+  BitField<u32, bool, 22, 1> vertical_interlace;
+  BitField<u32, bool, 23, 1> display_disable;
+  BitField<u32, bool, 24, 1> interrupt_request;
+  BitField<u32, bool, 25, 1> dma_data_request;
+  BitField<u32, bool, 26, 1> gpu_idle;
+  BitField<u32, bool, 27, 1> ready_to_send_vram;
+  BitField<u32, bool, 28, 1> ready_to_receive_dma;
+  BitField<u32, GPUDMADirection, 29, 2> dma_direction;
+  BitField<u32, bool, 31, 1> display_line_lsb;
+
+  ALWAYS_INLINE bool IsMaskingEnabled() const
+  {
+    static constexpr u32 MASK = ((1 << 11) | (1 << 12));
+    return ((bits & MASK) != 0);
+  }
+  ALWAYS_INLINE bool SkipDrawingToActiveField() const
+  {
+    static constexpr u32 MASK = (1 << 19) | (1 << 22) | (1 << 10);
+    static constexpr u32 ACTIVE = (1 << 19) | (1 << 22);
+    return ((bits & MASK) == ACTIVE);
+  }
+  ALWAYS_INLINE bool InInterleaved480iMode() const
+  {
+    static constexpr u32 ACTIVE = (1 << 19) | (1 << 22);
+    return ((bits & ACTIVE) == ACTIVE);
+  }
+};
+
+union GPUVertexPosition
+{
+  u32 bits;
+
+  BitField<u32, s32, 0, 11> x;
+  BitField<u32, s32, 16, 11> y;
+};
+
+// bits in GP0(E1h) or texpage part of polygon
+union GPUDrawModeReg
+{
+  static constexpr u16 MASK = 0b11111111111111;
+  static constexpr u16 TEXTURE_MODE_AND_PAGE_MASK = UINT16_C(0b0000000110011111);
+
+  // Polygon texpage commands only affect bits 0-8, 11
+  static constexpr u16 POLYGON_TEXPAGE_MASK = 0b0000100111111111;
+
+  // Bits 0..5 are returned in the GPU status register, latched at E1h/polygon draw time.
+  static constexpr u32 GPUSTAT_MASK = 0b11111111111;
+
+  u16 bits;
+
+  BitField<u16, u8, 0, 5> texture_page;
+  BitField<u16, u8, 0, 4> texture_page_x_base;
+  BitField<u16, u8, 4, 1> texture_page_y_base;
+  BitField<u16, GPUTransparencyMode, 5, 2> transparency_mode;
+  BitField<u16, GPUTextureMode, 7, 2> texture_mode;
+  BitField<u16, bool, 9, 1> dither_enable;
+  BitField<u16, bool, 10, 1> draw_to_displayed_field;
+  BitField<u16, bool, 11, 1> texture_page_y_base_2;
+  BitField<u16, bool, 12, 1> texture_x_flip;
+  BitField<u16, bool, 13, 1> texture_y_flip;
+
+  ALWAYS_INLINE u32 GetTexturePageBaseX() const { return ZeroExtend32(texture_page_x_base.GetValue()) * 64; }
+  ALWAYS_INLINE u32 GetTexturePageBaseY() const { return ZeroExtend32(texture_page_y_base.GetValue()) * 256; }
+
+  /// Returns true if the texture mode requires a palette.
+  ALWAYS_INLINE bool IsUsingPalette() const { return (bits & (2 << 7)) == 0; }
+};
+
+union GPUTexturePaletteReg
+{
+  static constexpr u16 MASK = UINT16_C(0b0111111111111111);
+
+  u16 bits;
+
+  BitField<u16, u16, 0, 6> x;
+  BitField<u16, u16, 6, 9> y;
+
+  ALWAYS_INLINE constexpr u32 GetXBase() const { return static_cast<u32>(x) * 16u; }
+  ALWAYS_INLINE constexpr u32 GetYBase() const { return static_cast<u32>(y); }
+};
+
+union GPUTextureWindow
+{
+  struct
+  {
+    u8 and_x;
+    u8 and_y;
+    u8 or_x;
+    u8 or_y;
+  };
+
+  u32 bits;
+
+  ALWAYS_INLINE bool operator==(const GPUTextureWindow& rhs) const { return (bits == rhs.bits); }
+  ALWAYS_INLINE bool operator!=(const GPUTextureWindow& rhs) const { return (bits != rhs.bits); }
+};
+
+// 4x4 dither matrix.
+inline constexpr s32 DITHER_MATRIX[DITHER_MATRIX_SIZE][DITHER_MATRIX_SIZE] = {{-4, +0, -3, +1},  // row 0
+                                                                              {+2, -2, +3, -1},  // row 1
+                                                                              {-3, +1, -4, +0},  // row 2
+                                                                              {+3, -1, +2, -2}}; // row 3

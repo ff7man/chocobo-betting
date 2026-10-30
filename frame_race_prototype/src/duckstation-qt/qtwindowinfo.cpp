@@ -1,0 +1,394 @@
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+
+#include "qtwindowinfo.h"
+#include "qtutils.h"
+
+#include "core/core.h"
+#include "core/host.h"
+#include "core/settings.h"
+
+#include "util/gpu_device.h"
+
+#include "common/error.h"
+#include "common/log.h"
+
+#include <QtGui/QGuiApplication>
+#include <QtGui/QScreen>
+#include <QtWidgets/QWidget>
+
+#include <cmath>
+
+#if defined(_WIN32)
+
+#include "common/windows_headers.h"
+#include <QtCore/QOperatingSystemVersion>
+#include <dwmapi.h>
+
+#elif defined(__APPLE__)
+
+#include "common/cocoa_tools.h"
+#include <CoreFoundation/CFString.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+
+#elif defined(__linux__)
+
+#include <QtDBus/QDBusConnection>
+#include <QtDBus/QDBusInterface>
+#include <QtDBus/QDBusMessage>
+#include <QtDBus/QDBusReply>
+#include <qpa/qplatformnativeinterface.h>
+
+#ifdef ENABLE_X11
+#include "util/x11_tools.h"
+#endif
+
+#else
+
+#include <qpa/qplatformnativeinterface.h>
+
+#endif
+
+LOG_CHANNEL(Host);
+
+using namespace Qt::StringLiterals;
+
+namespace {
+
+struct WindowInfoLocals
+{
+#if defined(__APPLE__)
+  IOPMAssertionID screensaver_inhibit_assertion;
+#elif defined(__linux__)
+  // Prevent screensaver inhibits when running on platforms that don't have it (e.g. gamescope).
+  std::optional<QDBusInterface> screensaver_inhibit_interface;
+  u32 screensaver_inhibit_cookie = 0;
+  bool disable_screensaver_inhibit = false;
+#endif
+
+  bool screensaver_inhibited = false;
+};
+
+} // namespace
+
+static WindowInfoLocals s_window_info_locals;
+
+WindowInfoType QtUtils::GetWindowInfoType()
+{
+  // Windows and Apple are easy here since there's no display connection.
+#if defined(_WIN32)
+  return WindowInfoType::Win32;
+#elif defined(__APPLE__)
+  return WindowInfoType::MacOS;
+#else
+  const QString platform_name = QGuiApplication::platformName();
+  if (platform_name == "xcb"_L1)
+  {
+    // This is only used for determining the automatic Vulkan renderer, therefore XCB/XLib doesn't matter here.
+    // See the comment below for information about this bullshit.
+    return WindowInfoType::XCB;
+  }
+  else if (platform_name.startsWith("wayland"_L1))
+  {
+    return WindowInfoType::Wayland;
+  }
+  else
+  {
+    return WindowInfoType::Surfaceless;
+  }
+#endif
+}
+
+std::optional<WindowInfo> QtUtils::GetWindowInfoForWidget(QWidget* widget, RenderAPI render_api, Error* error)
+{
+  WindowInfo wi = {};
+
+  // Windows and Apple are easy here since there's no display connection.
+#if defined(_WIN32)
+  wi.type = WindowInfoType::Win32;
+  wi.window_handle = reinterpret_cast<void*>(widget->winId());
+#elif defined(__APPLE__)
+  wi.type = WindowInfoType::MacOS;
+  wi.window_handle = reinterpret_cast<void*>(widget->winId());
+#else
+  QPlatformNativeInterface* pni = QGuiApplication::platformNativeInterface();
+  const QString platform_name = QGuiApplication::platformName();
+  if (platform_name == QStringLiteral("xcb"))
+  {
+    // This is fucking ridiculous. NVIDIA+XWayland doesn't support Xlib, and NVIDIA+Xorg doesn't support XCB.
+    // Use Xlib if we're not running under Wayland, or we're not requesting OpenGL. Vulkan+XCB seems fine.
+    const char* xdg_session_type = std::getenv("XDG_SESSION_TYPE");
+    const bool is_running_on_xwayland = (xdg_session_type && std::strstr(xdg_session_type, "wayland"));
+    if (is_running_on_xwayland || render_api == RenderAPI::Vulkan)
+    {
+      wi.type = WindowInfoType::XCB;
+      wi.display_connection = pni->nativeResourceForWindow("connection", widget->windowHandle());
+    }
+    else
+    {
+      wi.type = WindowInfoType::Xlib;
+      wi.display_connection = pni->nativeResourceForWindow("display", widget->windowHandle());
+    }
+    wi.window_handle = reinterpret_cast<void*>(widget->winId());
+  }
+  else if (platform_name.startsWith("wayland"_L1))
+  {
+    wi.type = WindowInfoType::Wayland;
+    wi.display_connection = pni->nativeResourceForWindow("display", widget->windowHandle());
+    wi.window_handle = pni->nativeResourceForWindow("surface", widget->windowHandle());
+  }
+  else
+  {
+    Error::SetStringFmt(error, "Unknown PNI platform {}", platform_name.toStdString());
+    return std::nullopt;
+  }
+#endif
+
+  UpdateSurfaceSize(widget, render_api, &wi);
+  UpdateSurfaceRefreshRate(widget, &wi);
+
+  INFO_LOG("Window size: {}x{} (Qt {}x{}), scale: {}, refresh rate {} hz", wi.surface_width, wi.surface_height,
+           widget->width(), widget->height(), wi.surface_scale, wi.surface_refresh_rate);
+
+  return wi;
+}
+
+void QtUtils::UpdateSurfaceSize(QWidget* widget, RenderAPI render_api, WindowInfo* wi)
+{
+  // Why this nonsense? Qt's device independent sizes are integer, and fractional scaling is lossy.
+  // We can't get back the "real" size of the window. So we have to platform natively query the actual client size.
+#if defined(_WIN32)
+  if (RECT rc; GetClientRect(static_cast<HWND>(wi->window_handle), &rc))
+  {
+    const qreal device_pixel_ratio = widget->devicePixelRatio();
+    wi->surface_width = static_cast<u16>(rc.right - rc.left);
+    wi->surface_height = static_cast<u16>(rc.bottom - rc.top);
+    wi->surface_scale = static_cast<float>(device_pixel_ratio);
+    return;
+  }
+#elif defined(__APPLE__)
+  if (std::optional<std::pair<int, int>> size =
+        CocoaTools::GetViewSizeInPixels(reinterpret_cast<void*>(widget->winId())))
+  {
+    wi->surface_width = static_cast<u16>(size->first);
+    wi->surface_height = static_cast<u16>(size->second);
+    wi->surface_scale = static_cast<float>(widget->devicePixelRatio());
+
+    // Only use "real" fractional window scale for Metal renderer.
+    // Vulkan returns suboptimal constantly, triggering swap chain recreations.
+    if (render_api == RenderAPI::Metal &&
+        Core::GetBaseBoolSettingValue(Settings::INTERFACE_SECTION_NAME, "UseFractionalWindowScale", false))
+    {
+      if (const std::optional<double> real_device_pixel_ratio = CocoaTools::GetViewRealScalingFactor(wi->window_handle))
+      {
+        const QSize scaled_size =
+          ApplyDevicePixelRatioToSize(widget->size(), static_cast<qreal>(real_device_pixel_ratio.value()));
+        wi->surface_width = static_cast<u16>(scaled_size.width());
+        wi->surface_height = static_cast<u16>(scaled_size.height());
+        wi->surface_scale = static_cast<float>(real_device_pixel_ratio.value());
+      }
+    }
+
+    return;
+  }
+#elif defined(ENABLE_X11)
+  // On X11, Qt's size is updated as soon as a resize is requested, and rounded from its logical size. The server's
+  // size, which is what EGL/Vulkan see, is applied later by the window manager, and can be rounded differently with
+  // fractional scaling. So use the server's size, DisplayWidget picks up changes to it from configure events.
+  if (wi->type == WindowInfoType::XCB || wi->type == WindowInfoType::Xlib)
+  {
+    if (const auto* x11_app = qGuiApp->nativeInterface<QNativeInterface::QX11Application>())
+    {
+      if (const std::optional<std::pair<int, int>> size =
+            X11Tools::GetWindowSize(x11_app->connection(), static_cast<xcb_window_t>(widget->winId())))
+      {
+        wi->surface_width = static_cast<u16>(size->first);
+        wi->surface_height = static_cast<u16>(size->second);
+        wi->surface_scale = static_cast<float>(widget->devicePixelRatio());
+        return;
+      }
+    }
+  }
+#endif
+
+  // On Wayland, you can't query it in the first place, the client picks the buffer size. fractional-scale-v1 defines
+  // it as the logical size multiplied by the scale, rounded half away from zero. Don't use ceil(), since float error
+  // with scales such as 140/120 can push an exact product over the next integer. Terrible fucking protocol, so broken.
+  const qreal device_pixel_ratio = widget->devicePixelRatio();
+  wi->surface_width = static_cast<u16>(std::lround(static_cast<qreal>(widget->width()) * device_pixel_ratio));
+  wi->surface_height = static_cast<u16>(std::lround(static_cast<qreal>(widget->height()) * device_pixel_ratio));
+  wi->surface_scale = static_cast<float>(device_pixel_ratio);
+}
+
+void QtUtils::UpdateSurfaceRefreshRate(QWidget* widget, WindowInfo* wi)
+{
+  const QScreen* widget_screen = widget->screen();
+  if (!widget_screen)
+    widget_screen = QGuiApplication::primaryScreen();
+  wi->surface_refresh_rate = widget_screen ? std::max(static_cast<float>(widget_screen->refreshRate()), 0.0f) : 0.0f;
+}
+
+#ifdef __linux__
+
+static void FormatQDBusReplyError(Error* error, const char* prefix, const QDBusError& qerror)
+{
+  Error::SetStringFmt(error, "{}{}: {}", prefix, qerror.name().toStdString(), qerror.message().toStdString());
+}
+
+#endif
+
+bool Host::SetScreensaverInhibit(bool inhibit, Error* error)
+{
+  if (s_window_info_locals.screensaver_inhibited == inhibit)
+    return true;
+
+#if defined(_WIN32)
+
+  if (SetThreadExecutionState(ES_CONTINUOUS | (inhibit ? (ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) : 0)) == NULL)
+  {
+    Error::SetWin32(error, "SetThreadExecutionState() failed: ", GetLastError());
+    return false;
+  }
+
+  s_window_info_locals.screensaver_inhibited = inhibit;
+  return true;
+
+#elif defined(__APPLE__)
+
+  if (inhibit)
+  {
+    const CFStringRef reason = CFSTR("DuckStation VM is running.");
+    const IOReturn ret =
+      IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn, reason,
+                                  &s_window_info_locals.screensaver_inhibit_assertion);
+    if (ret != kIOReturnSuccess)
+    {
+      Error::SetStringFmt(error, "IOPMAssertionCreateWithName() failed: {}", static_cast<s32>(ret));
+      return false;
+    }
+
+    s_window_info_locals.screensaver_inhibited = true;
+    return true;
+  }
+  else
+  {
+    const IOReturn ret = IOPMAssertionRelease(s_window_info_locals.screensaver_inhibit_assertion);
+    if (ret != kIOReturnSuccess)
+    {
+      Error::SetStringFmt(error, "IOPMAssertionRelease() failed: {}", static_cast<s32>(ret));
+      return false;
+    }
+
+    s_window_info_locals.screensaver_inhibit_assertion = kIOPMNullAssertionID;
+    s_window_info_locals.screensaver_inhibited = false;
+    return true;
+  }
+
+#elif defined(__linux__)
+
+  if (s_window_info_locals.disable_screensaver_inhibit)
+  {
+    // pretend it succeeded so the caller doesn't throw an error
+    s_window_info_locals.screensaver_inhibited = inhibit;
+    return true;
+  }
+
+  if (!s_window_info_locals.screensaver_inhibit_interface.has_value())
+  {
+    const QDBusConnection connection = QDBusConnection::sessionBus();
+    if (!connection.isConnected())
+    {
+      Error::SetStringView(error, "Failed to connect to the D-Bus session bus");
+      return false;
+    }
+
+    s_window_info_locals.screensaver_inhibit_interface.emplace(
+      "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver", connection);
+    if (!s_window_info_locals.screensaver_inhibit_interface->isValid())
+    {
+      s_window_info_locals.screensaver_inhibit_interface.reset();
+      Error::SetStringView(error, "org.freedesktop.ScreenSaver interface is invalid");
+      return false;
+    }
+  }
+
+  if (inhibit)
+  {
+    const QDBusReply<quint32> msg = s_window_info_locals.screensaver_inhibit_interface->call(
+      "Inhibit", u"DuckStation"_s, u"DuckStation VM is running."_s);
+    if (!msg.isValid())
+    {
+      FormatQDBusReplyError(error, "Inhibit message call failed: ", msg.error());
+      return false;
+    }
+
+    s_window_info_locals.screensaver_inhibit_cookie = msg.value();
+    s_window_info_locals.screensaver_inhibited = true;
+    return true;
+  }
+  else
+  {
+    const QDBusReply<void> msg = s_window_info_locals.screensaver_inhibit_interface->call(
+      "UnInhibit", s_window_info_locals.screensaver_inhibit_cookie);
+    if (!msg.isValid())
+    {
+      FormatQDBusReplyError(error, "UnInhibit message call failed: ", msg.error());
+      return false;
+    }
+
+    s_window_info_locals.screensaver_inhibit_cookie = 0;
+    s_window_info_locals.screensaver_inhibited = false;
+    return true;
+  }
+
+#else
+
+  Error::SetStringView(error, "Not implemented.");
+  return false;
+
+#endif
+}
+
+#ifdef _WIN32
+
+bool QtUtils::SetWindowRoundedCornerState(QWidget* widget, std::optional<bool> enabled)
+{
+  // DWMWA_WINDOW_CORNER_PREFERENCE was added in Windows 11, it fails on Windows 10.
+  if (QOperatingSystemVersion::current() < QOperatingSystemVersion::Windows11)
+    return false;
+
+  const HWND window_handle = reinterpret_cast<HWND>(widget->winId());
+
+  const DWM_WINDOW_CORNER_PREFERENCE wanted_value =
+    enabled.has_value() ? (enabled.value() ? DWMWCP_ROUND : DWMWCP_DONOTROUND) : DWMWCP_DEFAULT;
+  DWM_WINDOW_CORNER_PREFERENCE current_value = DWMWCP_DEFAULT;
+  HRESULT hr =
+    DwmGetWindowAttribute(window_handle, DWMWA_WINDOW_CORNER_PREFERENCE, &current_value, sizeof(current_value));
+  if (FAILED(hr)) [[unlikely]]
+  {
+    ERROR_LOG("DwmGetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE) failed: {}",
+              Error::CreateHResult(hr).GetDescription());
+  }
+  else if (current_value == wanted_value)
+  {
+    return true;
+  }
+
+  hr = DwmSetWindowAttribute(window_handle, DWMWA_WINDOW_CORNER_PREFERENCE, &wanted_value, sizeof(wanted_value));
+  if (FAILED(hr)) [[unlikely]]
+  {
+    ERROR_LOG("DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE) failed: {}",
+              Error::CreateHResult(hr).GetDescription());
+  }
+
+  return SUCCEEDED(hr);
+}
+
+#endif // _WIN32
+
+void QtHost::DisableScreensaverInhibit()
+{
+#ifdef __linux__
+  s_window_info_locals.disable_screensaver_inhibit = true;
+#endif
+}
