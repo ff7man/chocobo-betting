@@ -36,7 +36,7 @@ Install Xcode Command Line Tools and DuckStation's required build dependencies f
 
 ## Configure your game files
 
-The four class save states are available in [`SCUS-94165_saves.zip`](SCUS-94165_saves.zip). Extract the archive and place `SCUS-94165_2.sav` through `SCUS-94165_5.sav` in your DuckStation `savestates` folder. Slots 2, 3, 4, and 5 are used for classes C, B, A, and S respectively.
+The four class save states are available in [`SCUS-94165_saves.zip`](SCUS-94165_saves.zip). Extract the archive and place `SCUS-94165_2.sav` through `SCUS-94165_5.sav` in your DuckStation `savestates` folder. Slots 2, 3, 4, and 5 are used for classes C, B, A, and S respectively. Each save is at the menu immediately after accepting a class, before pressing Circle to continue and load the Chocobo mini-game.
 
 The runner expects your local DuckStation data in the standard macOS locations:
 
