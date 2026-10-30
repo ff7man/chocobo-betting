@@ -1,0 +1,1123 @@
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 92c6103..a288b34 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -27,6 +27,8 @@ add_library(core
+   cheats.cpp
+   cheats.h
+   cheats_private.h
++  choco_runner.cpp
++  choco_runner.h
+   controller.cpp
+   controller.h
+   controller_helpers.h
+diff --git a/src/core/choco_runner.cpp b/src/core/choco_runner.cpp
+new file mode 100644
+index 0000000..4ed2644
+--- /dev/null
++++ b/src/core/choco_runner.cpp
+@@ -0,0 +1,1000 @@
++// SPDX-FileCopyrightText: 2026 OpenAI
++// SPDX-License-Identifier: CC-BY-NC-ND-4.0
++
++#include "choco_runner.h"
++
++#include "controller.h"
++#include "core.h"
++#include "cpu_core.h"
++#include "digital_controller.h"
++#include "fullscreenui.h"
++#include "system.h"
++
++#include "common/error.h"
++#include "common/log.h"
++
++#include <array>
++#include <algorithm>
++#include <charconv>
++#include <chrono>
++#include <cstdio>
++#include <fstream>
++#include <filesystem>
++#include <numeric>
++#include <string>
++#include <string_view>
++
++#include <fmt/format.h>
++
++LOG_CHANNEL(System);
++
++namespace ChocoRunner {
++namespace {
++
++// The Lua reference writes PSX RAM offsets 0x51568 and 0x95DC8 before pressing
++// Circle to enter the betting screen. DuckStation uses the KSEG0 alias here.
++constexpr u32 FRAME_COUNTER_ADDRESS = 0x80051568;
++constexpr u32 COURSE_LENGTH_ADDRESS = 0x80095DC8;
++constexpr u32 CHOCOBO_RACER_BASE = 0x800B7654;
++constexpr u32 CHOCOBO_RACER_STRIDE = 0xA4;
++constexpr u32 RACER_COUNT = 6;
++constexpr u32 RACER_STATUS_BASE = 0x800B763C;
++constexpr u32 BETTING_SCREEN_CONFIRM_FRAMES = 5;
++constexpr u32 AUTO_RACE_START_FRAMES = 10;
++constexpr u32 FRAME_CYCLE = 0x400000;
++
++enum class Stage : u8
++{
++  NotStarted,
++  OpeningBettingScreen,
++  WaitingForStats,
++  StartingRace,
++  AwaitingRaceFinish,
++  ProbingFrameCounter,
++  Finished,
++  Disabled
++};
++
++struct PatchState
++{
++  bool initialized = false;
++  Stage stage = Stage::NotStarted;
++  u32 frame_value = 0;
++  u32 target_frame = 0;
++  u32 frame_offset = 0;
++  u32 frames_until_capture = 0;
++  u32 capture_delay_frames = 100;
++  u32 auto_start_delay_frames = 595;
++  u32 betting_screen_frames = 0;
++  u32 race_start_frames = 0;
++  u32 race_frames = 0;
++  u32 course_value = 0;
++  bool auto_run = false;
++  bool run_both_courses = false;
++  bool exit_after_capture = false;
++  bool export_enabled = false;
++  bool data_generation = false;
++  bool data_both_courses = false;
++  bool data_class_c = false;
++  bool restore_fast_forward = false;
++  u32 races_completed = 0;
++  u32 data_start_frame = 0;
++  u32 data_end_frame = 0;
++  u32 data_current_frame = 0;
++  u32 data_first_race_id = 0;
++  u32 data_start_course_value = 0;
++  bool frame_counter_probe = false;
++  u32 probe_frame = 0;
++  u32 probe_frame_count = 0;
++  u32 probe_circle_frames = 0;
++  u32 probe_frames_done = 0;
++  std::string data_rank = "c";
++  std::chrono::steady_clock::time_point data_started_at{};
++  std::chrono::steady_clock::time_point data_last_progress_at{};
++  std::string state_path;
++  std::string export_path;
++};
++
++PatchState s_patch;
++std::ofstream s_csv_output;
++
++void PrintDataProgress(bool force = false)
++{
++  if (!s_patch.data_generation)
++    return;
++
++  using Clock = std::chrono::steady_clock;
++  const Clock::time_point now = Clock::now();
++  if (!force && now - s_patch.data_last_progress_at < std::chrono::seconds(10))
++    return;
++
++  const u64 complete = s_patch.races_completed - s_patch.data_first_race_id;
++  const u64 races_per_frame = s_patch.data_both_courses && !s_patch.data_class_c ? 2 : 1;
++  u64 total = (static_cast<u64>(s_patch.data_end_frame) - s_patch.data_start_frame + 1) * races_per_frame;
++  if (s_patch.data_both_courses && !s_patch.data_class_c && s_patch.data_start_course_value == 6)
++    total--;
++  const double elapsed_seconds = std::chrono::duration<double>(now - s_patch.data_started_at).count();
++  const double rate = elapsed_seconds > 0.0 ? static_cast<double>(complete) / elapsed_seconds : 0.0;
++  const u64 remaining_seconds = rate > 0.0 ? static_cast<u64>((total - std::min<u64>(complete, total)) / rate) : 0;
++  const u64 days = remaining_seconds / 86400;
++  const u64 hours = (remaining_seconds / 3600) % 24;
++  const u64 minutes = (remaining_seconds / 60) % 60;
++  const u64 seconds = remaining_seconds % 60;
++
++  if (rate > 0.0)
++  {
++    std::printf("Progress: %llu complete / %llu total | %.2f races/s | ETA %llud %02llu:%02llu:%02llu\n",
++                static_cast<unsigned long long>(complete), static_cast<unsigned long long>(total), rate,
++                static_cast<unsigned long long>(days), static_cast<unsigned long long>(hours),
++                static_cast<unsigned long long>(minutes), static_cast<unsigned long long>(seconds));
++  }
++  else
++  {
++    std::printf("Progress: %llu complete / %llu total | %.2f races/s | ETA calculating\n",
++                static_cast<unsigned long long>(complete), static_cast<unsigned long long>(total), rate);
++  }
++  std::fflush(stdout);
++  if (s_csv_output.is_open())
++    s_csv_output.flush();
++  s_patch.data_last_progress_at = now;
++}
++
++void SetControllerButtons(u32 bits)
++{
++  Controller* controller = System::GetController(0);
++  if (!controller)
++    return;
++
++  for (u32 button = 0; button < static_cast<u32>(DigitalController::Button::Count); button++)
++  {
++    const bool pressed = (bits & (u32(1) << button)) != 0;
++    controller->SetBindState(button, pressed ? 1.0f : 0.0f);
++  }
++}
++
++bool WriteCourseLengthValue(u32 width, u32 value)
++{
++  switch (width)
++  {
++    case 0:
++      return true;
++    case 1:
++      return CPU::SafeWriteMemoryByte(COURSE_LENGTH_ADDRESS, static_cast<u8>(value));
++    case 2:
++      return CPU::SafeWriteMemoryHalfWord(COURSE_LENGTH_ADDRESS, static_cast<u16>(value));
++    case 4:
++      return CPU::SafeWriteMemoryWord(COURSE_LENGTH_ADDRESS, value);
++    default:
++      return false;
++  }
++}
++
++bool ReadCourseLengthWord(u32* value)
++{
++  return CPU::SafeReadMemoryWord(COURSE_LENGTH_ADDRESS, value);
++}
++
++void FinishWithError(const std::string& message)
++{
++  ERROR_LOG("Chocobo memory patch: {}", message);
++  SetControllerButtons(0);
++  if (s_patch.restore_fast_forward)
++  {
++    System::SetFastForwardEnabled(false);
++    s_patch.restore_fast_forward = false;
++  }
++  s_patch.stage = Stage::Finished;
++  if (System::IsRunning())
++    System::PauseSystem(true);
++}
++
++std::string DecodeRacerName(u32 address)
++{
++  // Same character table used by ml/race.lua's decodeName().
++  static constexpr std::string_view char_map =
++    R"( !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~)";
++
++  std::string name;
++  name.reserve(6);
++  for (u32 offset = 0; offset < 6; offset++)
++  {
++    u8 value = 0;
++    if (!CPU::SafeReadMemoryByte(address + offset, &value))
++      return "<unreadable>";
++    if (value == 0xFF)
++      continue;
++
++    name.push_back(value < char_map.size() ? char_map[value] : char_map[0]);
++  }
++
++  return name;
++}
++
++struct RacerData
++{
++  std::string name;
++  u16 top_speed = 0;
++  u16 rs2 = 0;
++  u16 rs1 = 0;
++  u16 stamina = 0;
++  u16 stamina2 = 0;
++  u8 acceleration = 0;
++  u8 cooperation = 0;
++  u8 intelligence = 0;
++  u8 jockey = 0;
++  u8 sprint = 0;
++  u8 finish_order = 0;
++  u8 position = 0;
++  bool speed_ok = false;
++  bool rs2_ok = false;
++  bool rs1_ok = false;
++  bool stamina_ok = false;
++  bool stamina2_ok = false;
++  bool acceleration_ok = false;
++  bool cooperation_ok = false;
++  bool intelligence_ok = false;
++  bool jockey_ok = false;
++  bool sprint_ok = false;
++  bool finish_order_ok = false;
++  bool position_ok = false;
++};
++
++const char* GetJockeyColorName(u8 jockey_type)
++{
++  static constexpr std::array<const char*, 4> names = {"Silver", "Gold", "Bronze", "Platinum"};
++  return jockey_type < names.size() ? names[jockey_type] : "Unknown";
++}
++
++const char* GetCourseName()
++{
++  // Class C's checkpoint always runs the short course, even with the Lua value 0.
++  if (s_patch.state_path.find("_2.sav") != std::string::npos || s_patch.course_value == 6)
++    return "Short";
++  return "Long";
++}
++
++std::string JsonEscape(std::string_view value)
++{
++  std::string result;
++  result.reserve(value.size());
++  for (const char ch : value)
++  {
++    if (ch == '"' || ch == '\\')
++      result.push_back('\\');
++    if (static_cast<unsigned char>(ch) >= 0x20)
++      result.push_back(ch);
++  }
++  return result;
++}
++
++std::string CsvEscape(std::string_view value)
++{
++  if (value.find_first_of(",\"\r\n") == std::string_view::npos)
++    return std::string(value);
++  std::string escaped = "\"";
++  for (const char ch : value)
++  {
++    if (ch == '"')
++      escaped.push_back('"');
++    escaped.push_back(ch);
++  }
++  escaped.push_back('"');
++  return escaped;
++}
++
++u16 ReadBigEndianHalfWord(u32 address, bool* ok)
++{
++  u16 value = 0;
++  *ok = CPU::SafeReadMemoryHalfWord(address, &value);
++  return *ok ? static_cast<u16>((value >> 8) | (value << 8)) : 0;
++}
++
++void AppendDataCsv(const std::array<RacerData, RACER_COUNT>& racers)
++{
++  if (!s_csv_output.is_open())
++  {
++    const std::filesystem::path path(s_patch.export_path);
++    std::error_code ec;
++    const bool needs_header = !std::filesystem::exists(path, ec) ||
++                              std::filesystem::file_size(path, ec) == 0;
++    s_csv_output.open(path, std::ios::out | std::ios::app);
++    if (!s_csv_output)
++    {
++      ERROR_LOG("Could not append generated data to '{}'.", s_patch.export_path);
++      return;
++    }
++    if (needs_header)
++      s_csv_output << "raceid,ts,rs2,rs1,acc,coop,intel,stamina1,stamina2,sprinting,course,jockey,winorder,pos,name,rank,frame,random\n";
++  }
++
++  for (const RacerData& racer : racers)
++  {
++    bool course_ok = false;
++    const u16 course = ReadBigEndianHalfWord(CHOCOBO_RACER_BASE +
++      static_cast<u32>(&racer - racers.data()) * CHOCOBO_RACER_STRIDE - 148, &course_ok);
++    s_csv_output << s_patch.races_completed - 1 << ','
++           << (racer.speed_ok ? fmt::format("{}", racer.top_speed) : "0") << ','
++           << (racer.rs2_ok ? fmt::format("{}", racer.rs2) : "0") << ','
++           << (racer.rs1_ok ? fmt::format("{}", racer.rs1) : "0") << ','
++           << (racer.acceleration_ok ? fmt::format("{:X}", racer.acceleration) : "0") << ','
++           << (racer.cooperation_ok ? fmt::format("{:X}", racer.cooperation) : "0") << ','
++           << (racer.intelligence_ok ? fmt::format("{:X}", racer.intelligence) : "0") << ','
++           << (racer.stamina_ok ? fmt::format("{}", racer.stamina) : "0") << ','
++           << (racer.stamina2_ok ? fmt::format("{}", racer.stamina2) : "0") << ','
++           << (racer.sprint_ok ? fmt::format("{:X}", racer.sprint) : "0") << ','
++           << (course_ok ? fmt::format("{:X}", course) : "0") << ','
++           << (racer.jockey_ok ? fmt::format("{:X}", racer.jockey) : "0") << ','
++           << (racer.finish_order_ok ? fmt::format("{:X}", racer.finish_order) : "0") << ','
++           << (racer.position_ok ? fmt::format("{:X}", racer.position) : "0") << ','
++           << CsvEscape(racer.name) << ',' << s_patch.data_rank << ',' << s_patch.target_frame << ','
++           << s_patch.course_value << '\n';
++  }
++}
++
++void CaptureRacerStats()
++{
++  INFO_LOG("Chocobo stats captured after race finish (patched frame {}).", s_patch.frame_value);
++  std::array<RacerData, RACER_COUNT> racers;
++  for (u32 i = 0; i < RACER_COUNT; i++)
++  {
++    const u32 base = CHOCOBO_RACER_BASE + i * CHOCOBO_RACER_STRIDE;
++    RacerData& racer = racers[i];
++    racer.speed_ok = CPU::SafeReadMemoryHalfWord(base - 48, &racer.top_speed);
++    racer.rs2_ok = CPU::SafeReadMemoryHalfWord(base - 50, &racer.rs2);
++    racer.rs1_ok = CPU::SafeReadMemoryHalfWord(base - 58, &racer.rs1);
++    racer.acceleration_ok = CPU::SafeReadMemoryByte(base - 42, &racer.acceleration);
++    racer.cooperation_ok = CPU::SafeReadMemoryByte(base - 38, &racer.cooperation);
++    racer.intelligence_ok = CPU::SafeReadMemoryByte(base - 36, &racer.intelligence);
++    racer.stamina_ok = CPU::SafeReadMemoryHalfWord(base - 28, &racer.stamina);
++    racer.stamina2_ok = CPU::SafeReadMemoryHalfWord(base - 32, &racer.stamina2);
++    racer.jockey_ok = CPU::SafeReadMemoryByte(base - 130, &racer.jockey);
++    racer.sprint_ok = CPU::SafeReadMemoryByte(base - 60, &racer.sprint);
++    racer.finish_order_ok = CPU::SafeReadMemoryByte(base - 24, &racer.finish_order);
++    racer.position_ok = CPU::SafeReadMemoryByte(base - 6, &racer.position);
++    racer.name = DecodeRacerName(base);
++
++    if (!s_patch.data_generation)
++    {
++      INFO_LOG("Racer {}: name={}, speed_raw={} display_speed={}, stamina_raw={} display_stamina={}, "
++               "jockey_type={}, sprint_flag={}, finish_order={}, position={} "
++               "(reads: speed={}, stamina={}, jockey={}, sprint={}, finish_order={}, position={}).",
++               i + 1, racer.name,
++               racer.speed_ok ? fmt::format("{}", racer.top_speed) : "unreadable",
++               racer.speed_ok ? fmt::format("{}", racer.top_speed / 34) : "unreadable",
++               racer.stamina_ok ? fmt::format("{}", racer.stamina) : "unreadable",
++               racer.stamina_ok ? fmt::format("{}", racer.stamina / 20) : "unreadable",
++               racer.jockey_ok ? fmt::format("{}", racer.jockey) : "unreadable",
++               racer.sprint_ok ? fmt::format("0x{:02X}", racer.sprint) : "unreadable",
++               racer.finish_order_ok ? fmt::format("{}", racer.finish_order) : "unreadable",
++               racer.position_ok ? fmt::format("{}", racer.position) : "unreadable",
++               racer.speed_ok, racer.stamina_ok, racer.jockey_ok, racer.sprint_ok,
++               racer.finish_order_ok, racer.position_ok);
++    }
++  }
++
++  if (s_patch.data_generation)
++  {
++    AppendDataCsv(racers);
++    return;
++  }
++
++  std::array<u32, RACER_COUNT> finish_order_indices;
++  std::iota(finish_order_indices.begin(), finish_order_indices.end(), 0);
++  std::sort(finish_order_indices.begin(), finish_order_indices.end(), [&racers](u32 lhs, u32 rhs) {
++    if (racers[lhs].finish_order_ok && racers[rhs].finish_order_ok &&
++        racers[lhs].finish_order != racers[rhs].finish_order)
++      return racers[lhs].finish_order < racers[rhs].finish_order;
++    if (racers[lhs].finish_order_ok != racers[rhs].finish_order_ok)
++      return racers[lhs].finish_order_ok;
++    return lhs < rhs;
++  });
++
++  const RacerData* winner = nullptr;
++  for (const u32 i : finish_order_indices)
++  {
++    if (racers[i].finish_order_ok && racers[i].finish_order == 1)
++    {
++      winner = &racers[i];
++      break;
++    }
++  }
++
++  std::printf("\n%s race results (race %u): target frame %u (patched %u, offset +%u)\n",
++              GetCourseName(), s_patch.races_completed, s_patch.target_frame, s_patch.frame_value,
++              s_patch.frame_offset);
++  if (winner)
++    std::printf("Winner (%s): %s\n", GetCourseName(), winner->name.c_str());
++  else
++    std::printf("Winner (%s): unavailable (finish-order field was unreadable)\n", GetCourseName());
++  for (const u32 i : finish_order_indices)
++  {
++    const RacerData& racer = racers[i];
++    if (racer.position_ok)
++    {
++      std::printf("%u. %s | speed %u km | stamina %u | jockey %s (AI %u) | sprinting %s | end position (%u)\n",
++                  racer.finish_order_ok ? racer.finish_order : (i + 1), racer.name.c_str(),
++                  racer.speed_ok ? racer.top_speed / 34 : 0,
++                  racer.stamina_ok ? racer.stamina / 20 : 0,
++                  racer.jockey_ok ? GetJockeyColorName(racer.jockey) : "unknown",
++                  racer.jockey_ok ? static_cast<unsigned>(racer.jockey + 1) : 0,
++                  racer.sprint_ok && racer.sprint != 0 ? "yes" : "no",
++                  static_cast<unsigned>(racer.position));
++    }
++    else
++    {
++      std::printf("%u. %s | speed %u km | stamina %u | jockey %s (AI %u) | sprinting %s | end position (unavailable)\n",
++                  racer.finish_order_ok ? racer.finish_order : (i + 1), racer.name.c_str(),
++                  racer.speed_ok ? racer.top_speed / 34 : 0,
++                  racer.stamina_ok ? racer.stamina / 20 : 0,
++                  racer.jockey_ok ? GetJockeyColorName(racer.jockey) : "unknown",
++                  racer.jockey_ok ? static_cast<unsigned>(racer.jockey + 1) : 0,
++                  racer.sprint_ok && racer.sprint != 0 ? "yes" : "no");
++    }
++  }
++  const RacerData* first_place = nullptr;
++  const RacerData* second_place = nullptr;
++  for (const RacerData& racer : racers)
++  {
++    if (!racer.finish_order_ok)
++      continue;
++    if (racer.finish_order == 1)
++      first_place = &racer;
++    else if (racer.finish_order == 2)
++      second_place = &racer;
++  }
++  if (first_place && second_place)
++  {
++    const u32 first_chocobo = static_cast<u32>(first_place - racers.data()) + 1;
++    const u32 second_chocobo = static_cast<u32>(second_place - racers.data()) + 1;
++    std::printf("Top two winners (%s race): Chocobo %u and Chocobo %u (%u-%u)\n",
++                GetCourseName(), first_chocobo, second_chocobo, first_chocobo, second_chocobo);
++  }
++  else
++  {
++    std::printf("Top two winners (%s race): unavailable\n", GetCourseName());
++  }
++  std::fflush(stdout);
++
++  if (!s_patch.export_enabled)
++    return;
++
++  std::ofstream output(s_patch.export_path, std::ios::out | std::ios::app);
++  if (!output)
++  {
++    ERROR_LOG("Could not append Chocobo race export to '{}'.", s_patch.export_path);
++    return;
++  }
++
++  output << fmt::format("{{\"race_number\":{},\"course\":\"{}\",\"winner\":{},"
++                        "\"target_frame\":{},\"patched_frame\":{},\"frame_offset\":{},"
++                        "\"course_value\":{},\"state_file\":\"{}\",\"racers\":[",
++                        s_patch.races_completed, GetCourseName(),
++                        winner ? fmt::format("\"{}\"", JsonEscape(winner->name)) : "null",
++                        s_patch.target_frame, s_patch.frame_value, s_patch.frame_offset,
++                        s_patch.course_value, JsonEscape(s_patch.state_path));
++  for (u32 i = 0; i < RACER_COUNT; i++)
++  {
++    const RacerData& racer = racers[i];
++    if (i != 0)
++      output << ',';
++    output << fmt::format("{{\"racer\":{},\"name\":\"{}\",\"top_speed_raw\":{},"
++                          "\"top_speed\":{},\"stamina_raw\":{},\"stamina\":{},"
++                          "\"jockey_type\":{},\"jockey_color\":\"{}\",\"sprint_flag\":{},"
++                          "\"finish_order\":{},\"position\":{}}}",
++                          i + 1, JsonEscape(racer.name),
++                          racer.speed_ok ? fmt::format("{}", racer.top_speed) : "null",
++                          racer.speed_ok ? fmt::format("{}", racer.top_speed / 34) : "null",
++                          racer.stamina_ok ? fmt::format("{}", racer.stamina) : "null",
++                          racer.stamina_ok ? fmt::format("{}", racer.stamina / 20) : "null",
++                          racer.jockey_ok ? fmt::format("{}", racer.jockey) : "null",
++                          racer.jockey_ok ? GetJockeyColorName(racer.jockey) : "Unknown",
++                          racer.sprint_ok ? fmt::format("{}", racer.sprint) : "null",
++                          racer.finish_order_ok ? fmt::format("{}", racer.finish_order) : "null",
++                          racer.position_ok ? fmt::format("{}", racer.position) : "null");
++  }
++  output << "]}\n";
++  INFO_LOG("Appended race data export to '{}'.", s_patch.export_path);
++}
++
++bool ReloadCheckpointForCourse(u32 course_value)
++{
++  Error error;
++  const std::optional<bool> loaded = System::LoadState(s_patch.state_path.c_str(), &error, false, false);
++  if (!loaded.has_value() || !loaded.value())
++  {
++    FinishWithError(fmt::format("failed to reload '{}' for the second course{}{}", s_patch.state_path,
++                                error.IsValid() ? ": " : "", error.GetDescription()));
++    return false;
++  }
++  if (!CPU::SafeWriteMemoryWord(FRAME_COUNTER_ADDRESS, s_patch.frame_value) ||
++      !WriteCourseLengthValue(1, course_value))
++  {
++    FinishWithError(fmt::format("couldn't patch frame {} and course {} for the second race.",
++                                s_patch.frame_value, course_value));
++    return false;
++  }
++
++  s_patch.course_value = course_value;
++  s_patch.betting_screen_frames = 0;
++  s_patch.frames_until_capture = s_patch.capture_delay_frames;
++  s_patch.race_start_frames = 0;
++  s_patch.race_frames = 0;
++  s_patch.stage = Stage::OpeningBettingScreen;
++  SetControllerButtons(u32(1) << static_cast<u32>(DigitalController::Button::Circle));
++  INFO_LOG("Reloaded checkpoint for the {} race at target frame {}; course value {}. Opening betting screen.",
++           GetCourseName(), s_patch.target_frame, course_value);
++  return true;
++}
++
++bool StartNextDataRun()
++{
++  u32 next_frame = s_patch.data_current_frame;
++  u32 next_course = s_patch.course_value;
++  if (s_patch.data_both_courses && !s_patch.data_class_c && next_course == 0)
++  {
++    next_course = 6;
++  }
++  else
++  {
++    if (next_frame >= s_patch.data_end_frame)
++    {
++      PrintDataProgress(true);
++      INFO_LOG("Dataset complete: {} race runs written through frame {}.",
++               s_patch.races_completed - s_patch.data_first_race_id, s_patch.data_end_frame);
++      if (s_patch.restore_fast_forward)
++      {
++        System::SetFastForwardEnabled(false);
++        s_patch.restore_fast_forward = false;
++      }
++      s_patch.stage = Stage::Finished;
++      Host::RequestExitApplication(false);
++      return false;
++    }
++    next_frame++;
++    next_course = 0;
++  }
++
++  s_patch.data_current_frame = next_frame;
++  s_patch.target_frame = next_frame;
++  s_patch.frame_value = (next_frame + FRAME_CYCLE - (s_patch.frame_offset % FRAME_CYCLE)) % FRAME_CYCLE;
++  s_patch.course_value = next_course;
++  Error error;
++  const std::optional<bool> loaded = System::LoadState(s_patch.state_path.c_str(), &error, false, false);
++  if (!loaded.has_value() || !loaded.value())
++  {
++    FinishWithError(fmt::format("failed to reload '{}' for dataset frame {}{}{}", s_patch.state_path,
++                                next_frame, error.IsValid() ? ": " : "", error.GetDescription()));
++    return false;
++  }
++  if (!CPU::SafeWriteMemoryWord(FRAME_COUNTER_ADDRESS, s_patch.frame_value) ||
++      !WriteCourseLengthValue(1, next_course))
++  {
++    FinishWithError(fmt::format("couldn't patch dataset frame {} and course {}.", next_frame, next_course));
++    return false;
++  }
++
++  s_patch.betting_screen_frames = 0;
++  s_patch.frames_until_capture = s_patch.capture_delay_frames;
++  s_patch.race_start_frames = 0;
++  s_patch.race_frames = 0;
++  s_patch.stage = Stage::OpeningBettingScreen;
++  SetControllerButtons(u32(1) << static_cast<u32>(DigitalController::Button::Circle));
++  if ((s_patch.races_completed % 1000) == 0)
++  {
++    INFO_LOG("Dataset progress: {} runs; next target frame {}, patched frame {}, course {}.",
++             s_patch.races_completed, next_frame, s_patch.frame_value, next_course);
++  }
++  return true;
++}
++
++void ApplyPatch()
++{
++  const std::string state_path = Core::GetBaseStringSettingValue("ChocoPatch", "StateFile", "");
++  const bool frame_counter_probe = Core::GetBaseBoolSettingValue("ChocoPatch", "FrameCounterProbe", false);
++  const u32 probe_frame = Core::GetBaseUIntSettingValue("ChocoPatch", "ProbeStartFrame", FRAME_CYCLE - 8);
++  const u32 probe_frame_count = Core::GetBaseUIntSettingValue("ChocoPatch", "ProbeFrameCount", 20);
++  const u32 probe_circle_frames = Core::GetBaseUIntSettingValue("ChocoPatch", "ProbeCircleFrames", 5);
++  const bool use_target_frame = Core::GetBaseBoolSettingValue("ChocoPatch", "UseTargetFrame", false);
++  const u32 configured_target_frame = Core::GetBaseUIntSettingValue("ChocoPatch", "TargetFrame", 0);
++  const u32 legacy_frame_value = Core::GetBaseUIntSettingValue("ChocoPatch", "FrameValue", 0);
++  u32 course_width = Core::GetBaseUIntSettingValue("ChocoPatch", "CourseLengthWriteWidth", 0);
++  u32 course_value = Core::GetBaseUIntSettingValue("ChocoPatch", "CourseLengthValue", 0);
++  const u32 capture_delay = Core::GetBaseUIntSettingValue("ChocoPatch", "CaptureDelayFrames", 100);
++  const u32 auto_start_delay = Core::GetBaseUIntSettingValue("ChocoPatch", "AutoStartDelayFrames", 595);
++  const bool auto_run = Core::GetBaseBoolSettingValue("ChocoPatch", "AutoRun", false);
++  const bool run_both_courses = Core::GetBaseBoolSettingValue("ChocoPatch", "RunBothCourses", false);
++  const bool exit_after_capture = Core::GetBaseBoolSettingValue("ChocoPatch", "ExitAfterCapture", false);
++  const std::string frame_offset_setting = Core::GetBaseStringSettingValue("ChocoPatch", "FrameOffset", "auto");
++  const std::string export_path = Core::GetBaseStringSettingValue("ChocoPatch", "ExportPath", "");
++  const bool data_generation = Core::GetBaseBoolSettingValue("ChocoPatch", "DataGeneration", false);
++  const u32 data_start_frame = Core::GetBaseUIntSettingValue("ChocoPatch", "DataStartFrame", 0);
++  const u32 data_end_frame = Core::GetBaseUIntSettingValue("ChocoPatch", "DataEndFrame", 1000);
++  const std::string data_course_mode = Core::GetBaseStringSettingValue("ChocoPatch", "DataCourseMode", "both");
++  const u32 data_start_course_value = Core::GetBaseUIntSettingValue("ChocoPatch", "DataStartCourseValue", 0);
++  const std::string data_rank = Core::GetBaseStringSettingValue("ChocoPatch", "DataRank", "c");
++  const u32 data_first_race_id = Core::GetBaseUIntSettingValue("ChocoPatch", "DataFirstRaceId", 0);
++
++  if (state_path.empty())
++  {
++    FinishWithError("set StateFile in the [ChocoPatch] section of settings.ini.");
++    return;
++  }
++  if (frame_counter_probe)
++  {
++    if (probe_frame_count == 0 || probe_circle_frames > probe_frame_count)
++    {
++      FinishWithError("Frame counter probe needs ProbeFrameCount > 0 and ProbeCircleFrames <= ProbeFrameCount.");
++      return;
++    }
++    Error probe_error;
++    const std::optional<bool> loaded = System::LoadState(state_path.c_str(), &probe_error, false, false);
++    if (!loaded.has_value() || !loaded.value())
++    {
++      FinishWithError(fmt::format("failed to load '{}' for frame counter probe{}{}", state_path,
++                                  probe_error.IsValid() ? ": " : "", probe_error.GetDescription()));
++      return;
++    }
++    if (!CPU::SafeWriteMemoryWord(FRAME_COUNTER_ADDRESS, probe_frame))
++    {
++      FinishWithError(fmt::format("couldn't write probe frame {} to 0x{:08X}.", probe_frame,
++                                  FRAME_COUNTER_ADDRESS));
++      return;
++    }
++    s_patch.state_path = state_path;
++    s_patch.frame_counter_probe = true;
++    s_patch.probe_frame = probe_frame;
++    s_patch.probe_frame_count = probe_frame_count;
++    s_patch.probe_circle_frames = probe_circle_frames;
++    s_patch.probe_frames_done = 0;
++    s_patch.stage = Stage::ProbingFrameCounter;
++    s_patch.restore_fast_forward = !System::IsFastForwardEnabled();
++    if (s_patch.restore_fast_forward)
++      System::SetFastForwardEnabled(true);
++    if (probe_circle_frames > 0)
++      SetControllerButtons(u32(1) << static_cast<u32>(DigitalController::Button::Circle));
++    INFO_LOG("Frame counter probe loaded '{}' and set 0x{:08X} to {}. Sampling {} frames.",
++             state_path, FRAME_COUNTER_ADDRESS, probe_frame, probe_frame_count);
++    std::printf("Frame counter probe: start=%u (0x%08X), samples=%u, Circle held for %u frames.\n",
++                probe_frame, probe_frame, probe_frame_count, probe_circle_frames);
++    std::fflush(stdout);
++    return;
++  }
++  const bool data_class_c = state_path.find("_2.sav") != std::string::npos;
++  if (data_generation)
++  {
++    if (data_start_frame > data_end_frame || data_end_frame >= FRAME_CYCLE)
++    {
++      FinishWithError(fmt::format("DataStartFrame/DataEndFrame must be an inclusive range within 0..{}.",
++                                  FRAME_CYCLE - 1));
++      return;
++    }
++    if (data_course_mode != "both" && data_course_mode != "short" && data_course_mode != "long")
++    {
++      FinishWithError("DataCourseMode must be 'both', 'short', or 'long'.");
++      return;
++    }
++    if (data_start_course_value != 0 && data_start_course_value != 6)
++    {
++      FinishWithError("DataStartCourseValue must be 0 (long) or 6 (short).");
++      return;
++    }
++    if (data_rank.size() != 1 || std::string_view("cbas").find(data_rank) == std::string_view::npos)
++    {
++      FinishWithError("DataRank must be one lowercase class letter: c, b, a, or s.");
++      return;
++    }
++    if (export_path.empty())
++    {
++      FinishWithError("set ExportPath to the CSV output file when DataGeneration=true.");
++      return;
++    }
++    if (!auto_run)
++    {
++      FinishWithError("DataGeneration requires AutoRun=true.");
++      return;
++    }
++    course_width = 1;
++    course_value = (data_class_c || data_course_mode == "long") ? 0 :
++                   (data_course_mode == "short" ? 6 : data_start_course_value);
++  }
++  if (course_width != 0 && course_width != 1 && course_width != 2 && course_width != 4)
++  {
++    FinishWithError("CourseLengthWriteWidth must be 0 (unchanged), 1, 2, or 4 bytes.");
++    return;
++  }
++  if (run_both_courses && (course_width != 1 || (course_value != 0 && course_value != 6)))
++  {
++    FinishWithError("RunBothCourses requires a one-byte CourseLengthValue of 0 or 6.");
++    return;
++  }
++  if (run_both_courses && data_class_c)
++  {
++    FinishWithError("Class C always runs short and cannot run both course lengths.");
++    return;
++  }
++  if (run_both_courses && !auto_run)
++  {
++    FinishWithError("RunBothCourses requires AutoRun=true.");
++    return;
++  }
++
++  u32 frame_offset = 0;
++  if (frame_offset_setting == "auto")
++  {
++    // Interactive calibration: C/B/A = +63; S = +64. Batch capture at the Class C
++    // checkpoint shows its automatic race path advances +64.
++    frame_offset = (state_path.find("_5.sav") != std::string::npos ||
++                    (data_generation && data_class_c)) ? 64 : 63;
++  }
++  else
++  {
++    const char* begin = frame_offset_setting.data();
++    const char* end = begin + frame_offset_setting.size();
++    const auto parse_result = std::from_chars(begin, end, frame_offset);
++    if (parse_result.ec != std::errc{} || parse_result.ptr != end)
++    {
++      FinishWithError("FrameOffset must be 'auto' or an unsigned integer.");
++      return;
++    }
++  }
++
++  const u32 target_frame = data_generation ? data_start_frame :
++                           (use_target_frame ? configured_target_frame : (legacy_frame_value + frame_offset) % FRAME_CYCLE);
++  if (target_frame >= FRAME_CYCLE)
++  {
++    FinishWithError(fmt::format("TargetFrame must be less than the {}-frame cycle.", FRAME_CYCLE));
++    return;
++  }
++  const u32 frame_value = (data_generation || use_target_frame) ?
++    (target_frame + FRAME_CYCLE - (frame_offset % FRAME_CYCLE)) % FRAME_CYCLE : legacy_frame_value;
++
++  Error error;
++  const std::optional<bool> loaded = System::LoadState(state_path.c_str(), &error, false, false);
++  if (!loaded.has_value() || !loaded.value())
++  {
++    FinishWithError(fmt::format("failed to load '{}'{}{}", state_path,
++                                error.IsValid() ? ": " : "", error.GetDescription()));
++    return;
++  }
++
++  u32 original_frame = 0;
++  u32 original_course_word = 0;
++  const bool read_frame = CPU::SafeReadMemoryWord(FRAME_COUNTER_ADDRESS, &original_frame);
++  const bool read_course = ReadCourseLengthWord(&original_course_word);
++
++  if (!CPU::SafeWriteMemoryWord(FRAME_COUNTER_ADDRESS, frame_value))
++  {
++    FinishWithError(fmt::format("couldn't write frame value {} to 0x{:08X}.", frame_value,
++                                FRAME_COUNTER_ADDRESS));
++    return;
++  }
++  if (!WriteCourseLengthValue(course_width, course_value))
++  {
++    FinishWithError(fmt::format("couldn't write course value {} ({} bytes) to 0x{:08X}.",
++                                course_value, course_width, COURSE_LENGTH_ADDRESS));
++    return;
++  }
++
++  u32 patched_frame = 0;
++  u32 patched_course_word = 0;
++  const bool read_patched_frame = CPU::SafeReadMemoryWord(FRAME_COUNTER_ADDRESS, &patched_frame);
++  const bool read_patched_course = ReadCourseLengthWord(&patched_course_word);
++  INFO_LOG("Chocobo checkpoint loaded. Target race frame {}; frame 0x{:08X}: {} -> {} (readback {}; offset +{}). Course word at "
++           "0x{:08X}: {} -> {} ({}-byte course write; value {}). Opening betting screen with Circle.",
++           target_frame,
++           FRAME_COUNTER_ADDRESS,
++           read_frame ? fmt::format("0x{:08X}", original_frame) : "unreadable", frame_value,
++           read_patched_frame ? fmt::format("0x{:08X}", patched_frame) : "unreadable",
++           frame_offset,
++           COURSE_LENGTH_ADDRESS,
++           read_course ? fmt::format("0x{:08X}", original_course_word) : "unreadable",
++           read_patched_course ? fmt::format("0x{:08X}", patched_course_word) : "unreadable",
++           course_width, course_value);
++
++  s_patch.frame_value = frame_value;
++  s_patch.target_frame = target_frame;
++  s_patch.frame_offset = frame_offset;
++  s_patch.course_value = course_value;
++  s_patch.state_path = state_path;
++  s_patch.auto_run = auto_run;
++  s_patch.run_both_courses = run_both_courses;
++  s_patch.races_completed = 0;
++  s_patch.exit_after_capture = exit_after_capture;
++  s_patch.export_path = export_path;
++  s_patch.export_enabled = !export_path.empty() && !data_generation;
++  s_patch.data_generation = data_generation;
++  s_patch.data_class_c = data_class_c;
++  s_patch.data_both_courses = data_generation ? (data_course_mode == "both") : false;
++  s_patch.data_start_frame = data_start_frame;
++  s_patch.data_end_frame = data_end_frame;
++  s_patch.data_current_frame = target_frame;
++  s_patch.data_first_race_id = data_first_race_id;
++  s_patch.data_start_course_value = course_value;
++  s_patch.data_rank = data_rank;
++  if (data_generation)
++  {
++    s_patch.races_completed = data_first_race_id;
++    s_patch.data_started_at = std::chrono::steady_clock::now();
++    s_patch.data_last_progress_at = s_patch.data_started_at;
++  }
++  s_patch.capture_delay_frames = capture_delay;
++  s_patch.frames_until_capture = capture_delay;
++  s_patch.auto_start_delay_frames = auto_start_delay;
++  s_patch.betting_screen_frames = 0;
++  s_patch.stage = Stage::OpeningBettingScreen;
++  SetControllerButtons(u32(1) << static_cast<u32>(DigitalController::Button::Circle));
++}
++
++} // namespace
++
++bool IsHeadlessEnabled()
++{
++  return Core::GetBaseBoolSettingValue("ChocoPatch", "Headless", false);
++}
++
++void OnFrame()
++{
++  if (!s_patch.initialized)
++  {
++    s_patch.initialized = true;
++    if (!Core::GetBaseBoolSettingValue("ChocoPatch", "Enabled", false))
++    {
++      s_patch.stage = Stage::Disabled;
++      return;
++    }
++
++    s_patch.stage = Stage::NotStarted;
++    INFO_LOG("Chocobo checkpoint patch is armed; it will load the configured state and generate its betting screen.");
++  }
++
++  PrintDataProgress();
++
++  if (s_patch.stage == Stage::ProbingFrameCounter)
++  {
++    u32 current_frame = 0;
++    const bool read_ok = CPU::SafeReadMemoryWord(FRAME_COUNTER_ADDRESS, &current_frame);
++    std::printf("FRAME_PROBE tick=%u counter=%s0x%08X (%u)\n", s_patch.probe_frames_done,
++                read_ok ? "" : "unreadable ", current_frame, current_frame);
++    std::fflush(stdout);
++    s_patch.probe_frames_done++;
++    SetControllerButtons(s_patch.probe_frames_done < s_patch.probe_circle_frames ?
++      (u32(1) << static_cast<u32>(DigitalController::Button::Circle)) : 0);
++    if (s_patch.probe_frames_done >= s_patch.probe_frame_count)
++    {
++      SetControllerButtons(0);
++      s_patch.stage = Stage::Finished;
++      if (s_patch.restore_fast_forward)
++      {
++        System::SetFastForwardEnabled(false);
++        s_patch.restore_fast_forward = false;
++      }
++      std::printf("Frame counter probe complete.\n");
++      std::fflush(stdout);
++      Host::RequestExitApplication(false);
++    }
++    return;
++  }
++
++  if (s_patch.stage == Stage::NotStarted && System::IsRunning())
++  {
++    ApplyPatch();
++    return;
++  }
++
++  if (s_patch.stage == Stage::OpeningBettingScreen)
++  {
++    s_patch.betting_screen_frames++;
++    if (s_patch.betting_screen_frames >= BETTING_SCREEN_CONFIRM_FRAMES)
++    {
++      SetControllerButtons(0);
++      s_patch.stage = Stage::WaitingForStats;
++      if (s_patch.auto_run)
++      {
++        s_patch.frames_until_capture = s_patch.auto_start_delay_frames;
++        s_patch.restore_fast_forward = !System::IsFastForwardEnabled();
++        if (s_patch.restore_fast_forward)
++          System::SetFastForwardEnabled(true);
++        INFO_LOG("Betting screen opened. Fast-forwarding {} frames to the automatic Start input.",
++                 s_patch.frames_until_capture);
++        INFO_LOG("Betting screen confirm sent for {} frames.", BETTING_SCREEN_CONFIRM_FRAMES);
++      }
++      else
++      {
++        INFO_LOG("Betting screen confirm sent for {} frames; waiting {} frames before reading generated racers.",
++                 BETTING_SCREEN_CONFIRM_FRAMES, s_patch.frames_until_capture);
++      }
++    }
++    return;
++  }
++
++  if (s_patch.stage == Stage::WaitingForStats && s_patch.frames_until_capture > 0)
++  {
++    s_patch.frames_until_capture--;
++    if (s_patch.frames_until_capture == 0)
++    {
++      SetControllerButtons(0);
++      if (s_patch.auto_run)
++      {
++        s_patch.stage = Stage::StartingRace;
++        s_patch.race_start_frames = 0;
++        SetControllerButtons(u32(1) << static_cast<u32>(DigitalController::Button::Start));
++        INFO_LOG("Betting screen is ready. Auto-starting race with Start.");
++      }
++      else
++      {
++        s_patch.stage = Stage::AwaitingRaceFinish;
++        s_patch.race_frames = 0;
++        INFO_LOG("Betting screen is ready. Start the race manually; racer memory will be captured when it finishes.");
++        System::PauseSystem(true);
++      }
++    }
++    return;
++  }
++
++  if (s_patch.stage == Stage::StartingRace)
++  {
++    s_patch.race_start_frames++;
++    if (s_patch.race_start_frames >= AUTO_RACE_START_FRAMES)
++    {
++      SetControllerButtons(0);
++      s_patch.stage = Stage::AwaitingRaceFinish;
++      s_patch.race_frames = 0;
++      INFO_LOG("Race start held with Start for {} frames; waiting for finish status.", AUTO_RACE_START_FRAMES);
++    }
++    return;
++  }
++
++  if (s_patch.stage == Stage::AwaitingRaceFinish && System::IsRunning())
++  {
++    bool race_finished = false;
++    for (u32 i = 0; i < RACER_COUNT; i++)
++    {
++      u8 status = 0;
++      if (CPU::SafeReadMemoryByte(RACER_STATUS_BASE + i * CHOCOBO_RACER_STRIDE, &status) && status == 6)
++      {
++        race_finished = true;
++        break;
++      }
++    }
++
++    if (race_finished)
++    {
++      s_patch.races_completed++;
++      CaptureRacerStats();
++      if (s_patch.data_generation)
++      {
++        StartNextDataRun();
++        return;
++      }
++      if (s_patch.run_both_courses && s_patch.races_completed == 1)
++      {
++        const u32 other_course_value = (s_patch.course_value == 6) ? 0 : 6;
++        ReloadCheckpointForCourse(other_course_value);
++        return;
++      }
++      if (s_patch.restore_fast_forward)
++      {
++        System::SetFastForwardEnabled(false);
++        s_patch.restore_fast_forward = false;
++      }
++      s_patch.stage = Stage::Finished;
++      if (s_patch.exit_after_capture)
++      {
++        INFO_LOG("Race capture complete. Closing DuckStation as configured.");
++        Host::RequestExitApplication(false);
++      }
++      else
++      {
++        System::PauseSystem(true);
++      }
++    }
++    else if (++s_patch.race_frames == 60 * 60 * 3)
++    {
++      ERROR_LOG("Chocobo memory capture timed out before a finish status appeared.");
++      s_patch.stage = Stage::Finished;
++      System::PauseSystem(true);
++    }
++  }
++}
++
++} // namespace ChocoRunner
+diff --git a/src/core/choco_runner.h b/src/core/choco_runner.h
+new file mode 100644
+index 0000000..766ddec
+--- /dev/null
++++ b/src/core/choco_runner.h
+@@ -0,0 +1,14 @@
++// SPDX-FileCopyrightText: 2026 OpenAI
++// SPDX-License-Identifier: CC-BY-NC-ND-4.0
++
++#pragma once
++
++namespace ChocoRunner {
++
++/// Advances the optional Chocobo seed patch and racer-memory capture by one frame.
++void OnFrame();
++
++/// Returns whether Chocobo runner output should be silent and not presented.
++bool IsHeadlessEnabled();
++
++} // namespace ChocoRunner
+diff --git a/src/core/system.cpp b/src/core/system.cpp
+index 4cf68ce..66bc19f 100644
+--- a/src/core/system.cpp
++++ b/src/core/system.cpp
+@@ -7,6 +7,7 @@
+ #include "bus.h"
+ #include "cdrom.h"
+ #include "cheats.h"
++#include "choco_runner.h"
+ #include "controller.h"
+ #include "core.h"
+ #include "core_private.h"
+@@ -45,6 +46,7 @@
+ #include "video_thread.h"
+ 
+ #include "util/cd_image.h"
++#include "util/audio_stream.h"
+ #include "util/compress_helpers.h"
+ #include "util/gpu_device.h"
+ #include "util/http_downloader.h"
+@@ -2055,6 +2057,12 @@ bool System::Initialize(std::unique_ptr<CDImage> disc, DiscRegion disc_region, b
+   DMA::Initialize();
+   Pad::Initialize();
+   Timers::Initialize();
++  if (ChocoRunner::IsHeadlessEnabled())
++  {
++    INFO_LOG("Chocobo runner headless mode: disabling audio output.");
++    g_settings.audio_backend = AudioBackend::Null;
++    g_settings.audio_output_muted = true;
++  }
+   SPU::Initialize();
+   MDEC::Initialize();
+   SIO::Initialize();
+@@ -2324,6 +2332,8 @@ void System::FrameDone()
+     InputManager::PollSources();
+   }
+ 
++  ChocoRunner::OnFrame();
++
+   // Frame step can still trigger exit
+   CheckForAndExitExecution();
+ 
+@@ -2350,7 +2360,7 @@ bool System::GetFramePresentationParameters(GPUBackendFramePresentationParameter
+                              s_state.skipped_frame_count < MAX_SKIPPED_TIMEOUT_FRAME_COUNT)) &&
+      !IsExecutionInterrupted());
+   frame->update_performance_counters = !is_duplicate_frame;
+-  frame->present_frame = !skip_this_frame;
++  frame->present_frame = !skip_this_frame && !ChocoRunner::IsHeadlessEnabled();
+   frame->present_time = (s_state.optimal_frame_pacing && s_state.throttler_enabled && !IsExecutionInterrupted()) ?
+                           s_state.next_frame_time :
+                           0;
+diff --git a/src/duckstation-qt/mainwindow.cpp b/src/duckstation-qt/mainwindow.cpp
+index da53907..1a5d8e5 100644
+--- a/src/duckstation-qt/mainwindow.cpp
++++ b/src/duckstation-qt/mainwindow.cpp
+@@ -371,6 +371,9 @@ bool MainWindow::hasDisplayWidget() const
+ 
+ void MainWindow::createDisplayWidget(bool fullscreen, bool render_to_main)
+ {
++  const bool choco_headless = QtHost::InNoGUIMode() &&
++                              Core::GetBaseBoolSettingValue("ChocoPatch", "Headless", false);
++
+   // If we're rendering to main and were hidden (e.g. coming back from fullscreen),
+   // make sure we're visible before trying to add ourselves. Otherwise Wayland breaks.
+   if (!fullscreen && render_to_main && !isVisible())
+@@ -405,7 +408,8 @@ void MainWindow::createDisplayWidget(bool fullscreen, bool render_to_main)
+   else if (!render_to_main)
+   {
+     restoreRenderWindowGeometryFromConfig();
+-    container->showNormal();
++    if (!choco_headless)
++      container->showNormal();
+   }
+   else
+   {
+@@ -419,7 +423,7 @@ void MainWindow::createDisplayWidget(bool fullscreen, bool render_to_main)
+   updateShortcutActions();
+   updateDisplayWidgetCursor();
+ 
+-  if (!render_to_main)
++  if (!render_to_main && !choco_headless)
+     QtUtils::ShowOrRaiseWindow(m_display_widget->window());
+   m_display_widget->setFocus();
+ }
