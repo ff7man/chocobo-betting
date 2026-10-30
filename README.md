@@ -10,3 +10,6 @@ Random scripts used in analyzing the chocobo betting in ff7 from 1997
 
 ## PlayStation Chocobo Race Finder
 [PSX frame and prize search tool](psx/)
+
+## PSX Computed Winner Lookup
+[Compact CSV-backed PSX race winner lookup](psxcomputed/)

@@ -1,0 +1,114 @@
+{
+  "format": "PSCDB1",
+  "version": 1,
+  "maxSeedExclusive": 25259,
+  "bytesPerSeed": 6,
+  "byteOrder": "little-endian",
+  "rankOrder": [
+    "C",
+    "B",
+    "A",
+    "S"
+  ],
+  "rankWordBits": "each rank has 12 bits: bits 0-2 long first, 3-5 long second, 6-8 short first, 9-11 short second; zero means unavailable",
+  "startupFramesSkipped": [
+    0,
+    1
+  ],
+  "sourceFiles": [
+    "ml/rankc.csv",
+    "ml/rankb.csv",
+    "ml/ranka.csv",
+    "ml/ranks.csv"
+  ],
+  "ranks": {
+    "C": {
+      "available": true,
+      "files": [
+        {
+          "file": "ml/rankc.csv",
+          "adjustments": [],
+          "groups": 25187
+        }
+      ],
+      "winnerRecords": 25187,
+      "seedRange": [
+        72,
+        25258
+      ],
+      "long": false,
+      "short": true,
+      "laterInputOverrides": 0
+    },
+    "B": {
+      "available": true,
+      "files": [
+        {
+          "file": "ml/rankb.csv",
+          "adjustments": [],
+          "groups": 26716
+        }
+      ],
+      "winnerRecords": 26716,
+      "seedRange": [
+        72,
+        13429
+      ],
+      "long": true,
+      "short": true,
+      "laterInputOverrides": 0
+    },
+    "A": {
+      "available": true,
+      "files": [
+        {
+          "file": "ml/ranka.csv",
+          "adjustments": [
+            {
+              "csv_frame": 7161,
+              "from": 69,
+              "to": 68
+            }
+          ],
+          "groups": 33541
+        }
+      ],
+      "winnerRecords": 33539,
+      "seedRange": [
+        71,
+        16840
+      ],
+      "long": true,
+      "short": true,
+      "laterInputOverrides": 0
+    },
+    "S": {
+      "available": true,
+      "files": [
+        {
+          "file": "ml/ranks.csv",
+          "adjustments": [
+            {
+              "csv_frame": 9673,
+              "from": 69,
+              "to": 68
+            }
+          ],
+          "groups": 39394
+        }
+      ],
+      "winnerRecords": 39392,
+      "seedRange": [
+        71,
+        19766
+      ],
+      "long": true,
+      "short": true,
+      "laterInputOverrides": 0
+    }
+  },
+  "recordCount": 124834,
+  "databaseBytes": 151566,
+  "compressedBytes": 99904,
+  "compression": "zip-deflate"
+}
