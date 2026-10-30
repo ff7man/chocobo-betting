@@ -16,3 +16,6 @@ Random scripts used in analyzing the chocobo betting in ff7 from 1997
 
 ## PSX Chocobo Data Generator
 [Farm PlayStation race data to expand PSX Computed](psxdatagen/)
+
+## PSX Chocobo Racer
+[Emulate the matched race at full speed and return the true winners](psxracer/)

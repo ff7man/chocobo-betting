@@ -1,0 +1,6 @@
+{
+  "game_image": "/path/to/your/Final Fantasy VII.cue",
+  "save_state_directory": "~/Library/Application Support/DuckStation/savestates",
+  "bios_directory": "~/Library/Application Support/DuckStation/bios",
+  "runner_timeout_seconds": 90
+}
