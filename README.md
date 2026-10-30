@@ -19,3 +19,6 @@ Random scripts used in analyzing the chocobo betting in ff7 from 1997
 
 ## PSX Chocobo Racer
 [Emulate the matched race at full speed and return the true winners](psxracer/)
+
+## Frame Race Prototype
+[Buildable DuckStation source for testing a target frame and reading actual race winners](frame_race_prototype/)
