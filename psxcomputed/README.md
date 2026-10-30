@@ -41,8 +41,11 @@ The packed database stores only the winning chocobo IDs (1–6): six bytes per
 frame for all four classes and both course lengths. A zero value means that
 course has no imported result. The hosted version currently contains the
 bundled historical CSV results; it does not simulate finishes or infer missing
-winner data. Use DuckStation-generated records to replace historical results
-where they disagree.
+winner data. The current data reaches only about the first 7 minutes after
+reset at most, and coverage ends earlier for some classes (B: about 3:44,
+A: 4:41, S: 5:29). Frames without imported winners cannot return a result.
+Use DuckStation-generated records to extend coverage and replace historical
+results where they disagree.
 
 The browser app and artwork are in `webapp/`. The top-level `index.html`
 redirects to the app for convenient folder-level access.

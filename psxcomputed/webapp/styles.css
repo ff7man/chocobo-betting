@@ -329,6 +329,7 @@ body[data-rank="B"] .gift-board {
 }
 .prize-hunt h2 { margin: 0 0 6px; font: 800 23px/1.2 sans-serif; }
 .prize-hunt > p { margin: 0 0 14px; color: #e3ddc1; font: 14px/1.4 sans-serif; }
+.prize-hunt > .database-coverage { margin: -7px 0 14px; color: #cbc5a8; font: 12px/1.35 sans-serif; }
 .prize-hunt-controls { display: grid; grid-template-columns: 1fr .45fr 1.35fr 1fr auto; align-items: end; gap: 12px; }
 .prize-hunt-controls label { display: grid; gap: 5px; font: 700 13px/1.2 sans-serif; text-transform: uppercase; }
 .prize-hunt-controls input, .prize-hunt-controls select {
