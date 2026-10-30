@@ -61,6 +61,22 @@ Headless=true
 ExportPath=/tmp/chocobo-race-results.jsonl
 ```
 
+### What the settings do
+
+| Setting | Effect |
+| --- | --- |
+| `Enabled` | Turns on the Chocobo runner patch. |
+| `StateFile` | Loads the class checkpoint (slots 2/3/4/5 for C/B/A/S). |
+| `UseTargetFrame` / `TargetFrame` | Uses the requested generator frame instead of legacy `FrameValue`; valid frames are `0`–`4,194,303`. |
+| `FrameOffset` | `auto` subtracts 63 frames for C/B/A or 64 for S before writing the counter. A number overrides the correction. |
+| `CourseLengthWriteWidth` / `CourseLengthValue` | Writes the selector as one byte: `6` short, `0` long. |
+| `AutoRun` / `AutoStartDelayFrames` | Starts automatically after the betting screen loads and waits the configured frames (595 here). |
+| `CaptureDelayFrames` | With `AutoRun=false`, waits this many frames at the betting screen, then pauses for you to start manually. |
+| `RunBothCourses` | With auto-run, reloads the checkpoint and runs the other course; supported for B/A/S, not C. |
+| `Headless` | Suppresses audio and video output for unattended runs. |
+| `ExitAfterCapture` | Closes DuckStation after reading the final race result. |
+| `ExportPath` | Appends race data as JSON Lines; leave empty to disable file export. |
+
 Run the build with an FFVII disc image (`.cue` or `.chd`):
 
 ```sh

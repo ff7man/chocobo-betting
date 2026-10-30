@@ -22,6 +22,24 @@ This is a direct emulation of the race rather than a winner guess based on speed
 
 The service listens on `127.0.0.1` only by default. It queues emulator requests so frame, save-state, and result settings cannot overlap. The game image, BIOS, and save states are not included.
 
+## DuckStation settings (managed by the server)
+
+You normally edit only `config.json`; before each race the service writes the relevant `[ChocoPatch]` values into `settings.ini` beside the selected DuckStation executable. It leaves unrelated DuckStation settings alone. The server sets:
+
+| Setting | What it controls |
+| --- | --- |
+| `Enabled` / `UseTargetFrame` | Enables the patch and uses the requested `TargetFrame`. |
+| `StateFile` | Class save slot: C=2, B=3, A=4, S=5. |
+| `TargetFrame` | The candidate frame found by the browser search. |
+| `FrameOffset` | `auto`: applies the calibrated class offset before writing RAM. |
+| `CourseLengthWriteWidth` / `CourseLengthValue` | Writes the course selector as one byte; `6` selects short and `0` long. C uses its short-only checkpoint. |
+| `AutoRun` / `AutoStartDelayFrames` | Starts the race automatically after the betting screen settles (595 frames). |
+| `RunBothCourses` | Runs short and long for B/A/S; disabled for C. |
+| `Headless` / `ExitAfterCapture` | Suppresses video/audio and closes DuckStation when results are captured. |
+| `ExportPath` | Temporary JSONL output the server reads and removes after the response. |
+
+The server also sets `CaptureDelayFrames=100`; the automatic start countdown is controlled by `AutoStartDelayFrames`. These settings are generated per request, so configure game, BIOS, and save-state paths in `config.json` instead of editing the runner's `settings.ini`.
+
 ## Build the isolated DuckStation runner
 
 This folder contains a source patch, not a compiled emulator. The patch is based on DuckStation revision `87bc8379b138860b242d7c7aea299e5872e9ae75` (2026-10-29). Clone that revision, apply the patch, and build:

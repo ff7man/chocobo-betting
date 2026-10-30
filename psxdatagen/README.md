@@ -44,6 +44,22 @@ The runner expects your local DuckStation data in the standard macOS locations:
 
 Override the game image with `--game /path/to/disc.cue` or `.chd`. The run uses class C slot 2, B slot 3, A slot 4, and S slot 5. The source runner uses calibrated frame corrections: C +64, B/A +63, and S +64 from requested frame to the value written before race generation.
 
+## DuckStation `settings.ini` values
+
+`run_parallel.py` creates a private `settings.ini` for each class worker and updates it when a run resumes. Use the command-line options instead of editing worker settings; the launcher fills these values automatically:
+
+| Setting | Source or meaning |
+| --- | --- |
+| `StateFile` / `DataRank` | Class checkpoint and lowercase rank (`c`, `b`, `a`, `s`). |
+| `DataStartFrame` / `DataEndFrame` | Inclusive range from `--start-frame` and `--end-frame`. |
+| `DataCourseMode` | `both`, `short`, or `long`; C always generates its short-only course. |
+| `DataStartCourseValue` | Course cursor used when resuming: `0` long, `6` short. |
+| `FrameOffset` | `auto` applies the calibrated class-specific frame correction. |
+| `DataFirstRaceId` / `ExportPath` | Next race ID and that worker's rank CSV path. |
+| `AutoRun` / `Headless` | Runs races automatically with audio/video output suppressed. |
+
+The launcher also sets `DataGeneration=true`, `AutoRun=true`, `Headless=true`, `AutoStartDelayFrames=595`, and `CaptureDelayFrames=100`. These timing and mode flags are managed by the script; edit the command-line range or game path instead of the worker INI. The separate `probe_framecounter.py` command writes probe settings itself: `--start` maps to `ProbeStartFrame`, `--samples` to `ProbeFrameCount`, and `--circle-frames` to `ProbeCircleFrames`; it enables `FrameCounterProbe` and uses the Class C state.
+
 ## Generate or resume a data run
 
 From the repository root, the default command generates frames 600–215,999 for all four classes, skipping the first ten seconds. It creates a timestamped folder under `psxdatagen/data/`, with separate rank CSVs and logs:
