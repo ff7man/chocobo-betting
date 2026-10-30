@@ -1,8 +1,0 @@
-40390df1f2792bb4053ff8c06097a63e8c3be104afe614c8f0b1b4bfcd813758 *deps-linux-cross-arm64.tar.xz
-ae8da339fd0d7ef70024614c896d71f7a595ad7c151b3aad8a113094a2156ac8 *deps-linux-cross-armhf.tar.xz
-b1335ffa558fd990754cd03cfc1f1aebfcb5a64dfd10918f630cd75c1df05da2 *deps-linux-x64.tar.xz
-981598da365fc7b120d71ae6eb1a221605a550ee219a17e76cd157a020afe9da *deps-macos-universal.tar.xz
-afcd620c04d4b2528e857f66b9e4777c680c23fa9c7c23ddc1f0a4bfae9ee13c *deps-windows-arm64.7z
-dd7ab05c9ee50e7dd6cb65ff4f0bdd4f48d37fd2df393d7a155c83d1768b0ff8 *deps-windows-qt-installer-arm64.7z
-f8b428b37e07d315f4c91cd7d5609c10ded22729edef605f88c5ace0d2e93122 *deps-windows-qt-installer-x64.7z
-a06713da9564feb71de74c1aab490d728e23ff4da6cde071a5740f150256ce49 *deps-windows-x64.7z
