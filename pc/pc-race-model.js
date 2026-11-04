@@ -227,9 +227,7 @@ function generatePcPrizesWithRandom(random, rank) {
     }
   }
 
-  // The PC game sorts selected prize IDs first, then moves the flagged reward
-  // to the final slot. Keep that ordering for the prize list and tile groups.
-  selected.sort((a, b) => a.id - b.id);
+  // Preserve the order prizes were drawn; the flagged reward still goes last.
   if (moveLastId !== -1) {
     const lastIndex = selected.findIndex((prize) => prize.id === moveLastId);
     selected.push(selected.splice(lastIndex, 1)[0]);
