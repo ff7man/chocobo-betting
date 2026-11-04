@@ -119,19 +119,27 @@ function renderPcBetGrid(rank, prizePrediction = null, bets = null) {
   }));
 }
 
+function pcDisplayedPrizeNames(prizes = []) {
+  const names = [...prizes];
+  // The PC menu's first two prize labels are reversed from the model's
+  // ID-sorted order; tile prize IDs continue to use the model order.
+  if (names.length >= 2) [names[0], names[1]] = [names[1], names[0]];
+  return names;
+}
+
 function renderPcGameScreen(entrants, rank, prizes, seedSeconds, bets) {
   document.body.dataset.rank = rank;
   renderRacers(field, entrants);
   renderPcBetGrid(rank, prizes, bets);
-  const giftNames = prizes?.prizes ?? [];
-  prizeOutput.replaceChildren(...giftNames.map((name) => {
+  const displayedGiftNames = pcDisplayedPrizeNames(prizes?.prizes ?? []);
+  prizeOutput.replaceChildren(...displayedGiftNames.map((name) => {
     const chip = document.createElement('span');
     chip.className = 'prize-chip';
     chip.textContent = prizeLabel(name);
     return chip;
   }));
   observedGiftSelects.forEach((select, index) => {
-    const giftName = giftNames[index];
+    const giftName = displayedGiftNames[index];
     if (giftName && Array.from(select.options).some((option) => option.value === giftName)) {
       select.value = giftName;
       select.dataset.autoPredictedGift = giftName;
@@ -191,7 +199,7 @@ function renderGapCandidate(match) {
   gapResultDetails.textContent = `Seed ${currentRunContext.seedSeconds} · Class ${currentRunContext.rank} · RNG call ${match.gap.toLocaleString()} from the starting field.`;
   renderRacers(gapField, match.field.entrants);
   if (match.prizes) {
-    gapPrizes.replaceChildren(...match.prizes.prizes.map((name) => {
+    gapPrizes.replaceChildren(...pcDisplayedPrizeNames(match.prizes.prizes).map((name) => {
       const item = document.createElement('span');
       item.className = 'prize-chip';
       item.textContent = prizeLabel(name);
@@ -266,7 +274,7 @@ function renderFutureMatch(match) {
     bets.append(strong);
   });
   const prizeLine = document.createElement('p');
-  prizeLine.textContent = `Predicted class ${match.rank} prizes: ${match.prizes.prizes.map(prizeLabel).join(', ')}`;
+  prizeLine.textContent = `Predicted class ${match.rank} prizes: ${pcDisplayedPrizeNames(match.prizes.prizes).map(prizeLabel).join(', ')}`;
   const racers = document.createElement('ol');
   racers.className = 'pc-racer-strip';
   renderRacers(racers, match.field.entrants);
@@ -434,7 +442,7 @@ seedSearchButton.addEventListener('click', () => {
         resultsPanel.scrollIntoView({ block: 'start', behavior: 'smooth' });
       });
       const gifts = document.createElement('p');
-    gifts.textContent = `Gifts: ${prizes.prizes.map(prizeLabel).join(', ')}`;
+      gifts.textContent = `Gifts: ${pcDisplayedPrizeNames(prizes.prizes).map(prizeLabel).join(', ')}`;
       card.append(heading, gifts, list, useButton);
       seedSearchResults.append(card);
     });
