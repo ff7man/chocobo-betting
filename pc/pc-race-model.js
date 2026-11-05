@@ -231,7 +231,12 @@ function generatePcPrizesWithRandom(random, rank) {
   selected.sort((a, b) => a.id - b.id);
   if (moveLastId !== -1) {
     const lastIndex = selected.findIndex((prize) => prize.id === moveLastId);
-    selected.push(selected.splice(lastIndex, 1)[0]);
+    // The game swaps the flagged prize with slot III in place. Removing and
+    // pushing it would shift the other prizes, which changes their order when
+    // the flagged prize sorted into slot I.
+    if (lastIndex >= 0 && lastIndex < 2) {
+      [selected[lastIndex], selected[2]] = [selected[2], selected[lastIndex]];
+    }
   }
 
   // The PC decomp shuffles fifteen bet tiles using 100 pairs of rand() calls.
