@@ -1,40 +1,43 @@
 {
-  "format": "PSCDB1",
-  "version": 1,
-  "maxSeedExclusive": 25259,
-  "bytesPerSeed": 6,
-  "byteOrder": "little-endian",
+  "format": "PSCDB2",
+  "version": 2,
+  "maxSeedExclusive": 215999,
   "rankOrder": [
     "C",
     "B",
     "A",
     "S"
   ],
-  "rankWordBits": "each rank has 12 bits: bits 0-2 long first, 3-5 long second, 6-8 short first, 9-11 short second; zero means unavailable",
   "startupFramesSkipped": [
     0,
     1
   ],
   "sourceFiles": [
-    "ml/rankc.csv",
-    "ml/rankb.csv",
-    "ml/ranka.csv",
-    "ml/ranks.csv"
+    "rankc.csv.zip",
+    "rankb.csv.zip",
+    "ranka.csv.zip",
+    "ranks.csv.zip"
   ],
   "ranks": {
     "C": {
       "available": true,
       "files": [
         {
-          "file": "ml/rankc.csv",
-          "adjustments": [],
-          "groups": 25187
+          "file": "rankc.csv.zip",
+          "adjustments": [
+            {
+              "csv_frame": 6660,
+              "from": 0,
+              "to": -1
+            }
+          ],
+          "groups": 215400
         }
       ],
-      "winnerRecords": 25187,
+      "winnerRecords": 215399,
       "seedRange": [
-        72,
-        25258
+        600,
+        215998
       ],
       "long": false,
       "short": true,
@@ -44,15 +47,21 @@
       "available": true,
       "files": [
         {
-          "file": "ml/rankb.csv",
-          "adjustments": [],
-          "groups": 26716
+          "file": "rankb.csv.zip",
+          "adjustments": [
+            {
+              "csv_frame": 6334,
+              "from": 0,
+              "to": -1
+            }
+          ],
+          "groups": 430800
         }
       ],
-      "winnerRecords": 26716,
+      "winnerRecords": 430798,
       "seedRange": [
-        72,
-        13429
+        600,
+        215998
       ],
       "long": true,
       "short": true,
@@ -62,21 +71,21 @@
       "available": true,
       "files": [
         {
-          "file": "ml/ranka.csv",
+          "file": "ranka.csv.zip",
           "adjustments": [
             {
-              "csv_frame": 7161,
-              "from": 69,
-              "to": 68
+              "csv_frame": 6384,
+              "from": 0,
+              "to": -1
             }
           ],
-          "groups": 33541
+          "groups": 430800
         }
       ],
-      "winnerRecords": 33539,
+      "winnerRecords": 430798,
       "seedRange": [
-        71,
-        16840
+        600,
+        215998
       ],
       "long": true,
       "short": true,
@@ -86,29 +95,43 @@
       "available": true,
       "files": [
         {
-          "file": "ml/ranks.csv",
+          "file": "ranks.csv.zip",
           "adjustments": [
             {
-              "csv_frame": 9673,
-              "from": 69,
-              "to": 68
+              "csv_frame": 6338,
+              "from": 0,
+              "to": -1
+            },
+            {
+              "csv_frame": 6339,
+              "from": -1,
+              "to": -2
             }
           ],
-          "groups": 39394
+          "groups": 430800
         }
       ],
-      "winnerRecords": 39392,
+      "winnerRecords": 430796,
       "seedRange": [
-        71,
-        19766
+        600,
+        215997
       ],
       "long": true,
       "short": true,
       "laterInputOverrides": 0
     }
   },
-  "recordCount": 124834,
-  "databaseBytes": 151566,
-  "compressedBytes": 99904,
-  "compression": "zip-deflate"
+  "recordCount": 1507791,
+  "databaseBytes": 753917,
+  "compressedBytes": 705267,
+  "compression": "zip-deflate",
+  "startSeed": 600,
+  "frameCount": 215399,
+  "headerStartSeedBits": 32,
+  "headerFrameCountBits": 64,
+  "bitsPerFrame": 28,
+  "bitsPerPair": 4,
+  "bitOrder": "little-endian; least-significant bits first",
+  "courseOrder": "short then long within each class; C has short only",
+  "pairEncoding": "lexicographic unordered pairs: code 0 is 1-2 through code 14 is 5-6; code 15 means unavailable"
 }

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a compact PSX Chocobo winner database from race.lua CSV exports.
 
-Each frame occupies six bytes: four 12-bit class words (long 1st/2nd,
-short 1st/2nd). A zero racer ID means that course is absent from the dataset.
-CSV historical frame labels are aligned to generator seeds by matching every
-racer's raw dash speed, stamina, jockey, sprint flag, and name.
+Each frame stores only the unordered top-two chocobo pair for each available
+class/course. Each of seven pairs is encoded as a 4-bit lexicographic pair ID;
+15 means unavailable. CSV frame labels are aligned to generator seeds using
+the complete race signature.
 """
 
 from __future__ import annotations
@@ -32,7 +32,18 @@ STATS = {
     "s": (0x1388, 0x0320, 0x0FA0, 0x01F4),
 }
 RANKS = ("c", "b", "a", "s")
-COURSES_PER_RANK = {"c": ("short",), "b": ("long", "short"), "a": ("long", "short"), "s": ("long", "short")}
+COURSES_PER_RANK = {"c": ("short",), "b": ("short", "long"), "a": ("short", "long"), "s": ("short", "long")}
+PAIR_BITS = 4
+PAIR_TO_CODE = {
+    pair: code
+    for code, pair in enumerate((
+        (first, second)
+        for first in range(1, 7)
+        for second in range(first + 1, 7)
+    ))
+}
+BITS_PER_FRAME = sum(len(courses) for courses in COURSES_PER_RANK.values()) * PAIR_BITS
+MISSING_PAIR = 0xF
 MASK = 0xFFFFFFFF
 PROJECT_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = PROJECT_ROOT.parent
@@ -151,18 +162,6 @@ def align_groups(groups: dict[tuple[int, int], list[dict[str, str]]], rank: str)
     return aligned, adjustments, len(usable)
 
 
-def rank_index(rank: str) -> int:
-    return RANKS.index(rank)
-
-
-def pack_course(existing: int, first: int, second: int, shift: int) -> int:
-    mask = 0x3F << shift
-    value = (first & 7) | ((second & 7) << 3)
-    if existing & mask and ((existing >> shift) & 0x3F) != value:
-        raise ValueError("conflicting winner data for aligned seed")
-    return (existing & ~mask) | (value << shift)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", action="append", type=Path, help="directory with rankc.csv, rankb.csv, ranka.csv, ranks.csv (repeatable)")
@@ -213,24 +212,34 @@ def main() -> None:
             "laterInputOverrides": overrides_by_rank[rank],
         }
 
-    # Per rank: 6 bits are long first/second and 6 bits are short first/second.
-    # Four 12-bit rank words are bit-packed little-endian = six bytes per seed.
+    if not records:
+        raise ValueError("no winner records were loaded; check the input directories")
+
+    # Store the unordered top-two bet pair in class order, short then long.
+    # There are 15 possible pairs among six chocobos, so each pair needs 4 bits;
+    # code 15 marks a course with no imported result. Seven courses use 28 bits.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw_path = args.output.with_name(args.output.name + ".raw.tmp")
     with raw_path.open("wb") as output:
-        output.write(b"PSCDB1\0\0")
-        output.write(struct.pack("<I", max_seed + 1))
-        for seed in range(max_seed + 1):
-            packed = 0
+        min_seed = min(seed for _rank, seed, _course in records)
+        frame_count = max_seed + 1 - min_seed
+        output.write(b"PSCDB2\0\0")
+        output.write(struct.pack("<IQ", min_seed, frame_count))
+        bit_buffer = 0
+        buffered_bits = 0
+        for seed in range(min_seed, max_seed + 1):
             for rank in RANKS:
-                word = 0
-                for course, shift in (("long", 0), ("short", 6)):
+                for course in COURSES_PER_RANK[rank]:
                     pair = records.get((rank, seed, course))
-                    if pair:
-                        word = pack_course(word, *pair, shift)
-                bit_offset = rank_index(rank) * 12
-                packed |= word << bit_offset
-            output.write(packed.to_bytes(6, "little"))
+                    code = MISSING_PAIR if pair is None else PAIR_TO_CODE[tuple(sorted(pair))]
+                    bit_buffer |= code << buffered_bits
+                    buffered_bits += PAIR_BITS
+                    if buffered_bits >= 8:
+                        output.write(bytes((bit_buffer & 0xFF,)))
+                        bit_buffer >>= 8
+                        buffered_bits -= 8
+        if buffered_bits:
+            output.write(bytes((bit_buffer & 0xFF,)))
 
     raw_bytes = raw_path.stat().st_size
     with ZipFile(args.output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
@@ -238,13 +247,19 @@ def main() -> None:
     raw_path.unlink()
 
     metadata = {
-        "format": "PSCDB1",
-        "version": 1,
+        "format": "PSCDB2",
+        "version": 2,
+        "startSeed": min_seed,
+        "frameCount": frame_count,
+        "headerStartSeedBits": 32,
+        "headerFrameCountBits": 64,
         "maxSeedExclusive": max_seed + 1,
-        "bytesPerSeed": 6,
-        "byteOrder": "little-endian",
+        "bitsPerFrame": BITS_PER_FRAME,
+        "bitsPerPair": PAIR_BITS,
+        "bitOrder": "little-endian; least-significant bits first",
         "rankOrder": ["C", "B", "A", "S"],
-        "rankWordBits": "each rank has 12 bits: bits 0-2 long first, 3-5 long second, 6-8 short first, 9-11 short second; zero means unavailable",
+        "courseOrder": "short then long within each class; C has short only",
+        "pairEncoding": "lexicographic unordered pairs: code 0 is 1-2 through code 14 is 5-6; code 15 means unavailable",
         "startupFramesSkipped": [0, 1],
         "sourceFiles": [display_path(path) for directory in dirs for rank in RANKS if (path := directory / f"rank{rank}.csv").is_file()],
         "ranks": rank_reports,
