@@ -72,8 +72,10 @@ The browser searches the full unsigned 32-bit frame-counter cycle
 (2^32 = 4,294,967,296 frames, about 828 days at 60 fps), wrapping from the
 maximum frame back to zero. If no match is found after 24 hours of searched
 frames (5,184,000 frames), it pauses and asks whether to continue, repeating
-the prompt after each additional 24 hours. Winner data is currently available
-only for the generated range described above.
+the prompt after each additional 24 hours. `Find Winnable Prize Frames` uses
+recorded winners for frames in the cached range; outside that range it falls
+back to the original top-speed and jockey-rank heuristic, excluding Bronze
+jockeys. These outside-cache suggestions are estimates, not confirmed winners.
 
 Frame matching uses the included `webapp/race_search.c` compiled to
 `webapp/race-search.wasm`; JavaScript builds the full race when a seed matches.
