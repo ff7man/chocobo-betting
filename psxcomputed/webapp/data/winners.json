@@ -1,7 +1,6 @@
 {
-  "format": "PSCDB2",
-  "version": 2,
-  "maxSeedExclusive": 215999,
+  "format": "PSCDB3",
+  "version": 3,
   "rankOrder": [
     "C",
     "B",
@@ -122,16 +121,14 @@
     }
   },
   "recordCount": 1507791,
-  "databaseBytes": 753917,
-  "compressedBytes": 705267,
+  "databaseBytes": 753909,
+  "compressedBytes": 705261,
   "compression": "zip-deflate",
   "startSeed": 600,
-  "frameCount": 215399,
   "headerStartSeedBits": 32,
-  "headerFrameCountBits": 64,
   "bitsPerFrame": 28,
   "bitsPerPair": 4,
   "bitOrder": "little-endian; least-significant bits first",
   "courseOrder": "short then long within each class; C has short only",
-  "pairEncoding": "lexicographic unordered pairs: code 0 is 1-2 through code 14 is 5-6; code 15 means unavailable"
+  "pairEncoding": "lexicographic unordered pairs: code 0 is 1-2 through code 14 is 5-6; code 15 means unavailable; frame count inferred from payload length"
 }

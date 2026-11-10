@@ -447,8 +447,10 @@ async function requestEmulatorResults(frame,rank){
     const {view,metadata}=await loadWinnerDatabase();
     const bytes=new Uint8Array(view.buffer,view.byteOffset,view.byteLength);
     const magic=String.fromCharCode(...bytes.slice(0,6));
-    if(magic!=='PSCDB2')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
-    const startSeed=view.getUint32(8,true),frameCount=Number(view.getBigUint64(12,true));
+    if(magic!=='PSCDB3')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
+    const startSeed=view.getUint32(8,true),payloadBytes=bytes.length-12;
+    const frameCount=Math.floor(payloadBytes*8/28);
+    if(frameCount<=0||Math.ceil(frameCount*28/8)!==payloadBytes)throw new Error('Winner database has an invalid packed frame length. Rebuild it with build_db.py.');
     const maxSeedExclusive=startSeed+frameCount;
     if(frame<startSeed||frame>=maxSeedExclusive)throw new Error(`Frame ${frame.toLocaleString()} is outside the current database (${startSeed.toLocaleString()}–${(maxSeedExclusive-1).toLocaleString()}).`);
     const rankCourseIndex={C:{short:0},B:{short:1,long:2},A:{short:3,long:4},S:{short:5,long:6}};
@@ -457,7 +459,7 @@ async function requestEmulatorResults(frame,rank){
       const courseIndex=rankCourseIndex[rank][course];
       if(courseIndex===undefined)continue;
       const bitOffset=(frame-startSeed)*28+courseIndex*4;
-      const byteOffset=20+Math.floor(bitOffset/8),bitShift=bitOffset%8;
+      const byteOffset=12+Math.floor(bitOffset/8),bitShift=bitOffset%8;
       const pairCode=((bytes[byteOffset]|(bytes[byteOffset+1]<<8))>>>bitShift)&0xF;
       if(pairCode!==0xF)races.push({course,winner_pair:BET_PAIRS[pairCode]});
     }
