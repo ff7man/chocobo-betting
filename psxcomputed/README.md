@@ -15,17 +15,23 @@ run `./run.sh` from this folder and open <http://127.0.0.1:8766>.
 ## Rebuild the database
 
 The binary database is in `webapp/data/winners.zip`; the browser unpacks it
-with the bundled JSZip library and keeps the decoded data in memory. Rebuild
-it from this folder with:
+with the bundled JSZip library and keeps the decoded data in memory.
+
+The full-hour race archives are in the repository-level `../data/` folder.
+Extract them to a temporary directory and pass that directory to the builder:
 
 ```sh
-python3 build_db.py
+tmpdir=$(mktemp -d)
+for rank in c b a s; do
+  unzip -p "../data/rank${rank}.csv.zip" "rank${rank}.csv" > "$tmpdir/rank${rank}.csv"
+done
+python3 build_db.py --input-dir "$tmpdir"
+rm -r "$tmpdir"
 ```
 
-If `data/source/` is present, the builder uses it. Otherwise it uses the
-repository's existing `../ml/` race.lua CSVs. It aligns the CSV frames to
-generator seeds by matching all six racers' stats and names, skips anomalous
-startup frame 1, and reports detected offset changes in `winners.json`.
+The builder aligns CSV frames to generator seeds by matching all six racers'
+stats and names, skips anomalous startup frame 1, and reports detected offset
+changes in `winners.json`.
 
 To merge a DuckStation-generated folder after a data run, put it after the old
 CSV source and use `--prefer-later-input`, so later emulator winners replace
@@ -39,13 +45,23 @@ python3 build_db.py --input-dir ../ml \
 
 The packed database stores only the winning chocobo IDs (1–6): six bytes per
 frame for all four classes and both course lengths. A zero value means that
-course has no imported result. The hosted version currently contains the
-bundled historical CSV results; it does not simulate finishes or infer missing
-winner data. The current data reaches only about the first 7 minutes after
-reset at most, and coverage ends earlier for some classes (B: about 3:44,
-A: 4:41, S: 5:29). Frames without imported winners cannot return a result.
-Use DuckStation-generated records to extend coverage and replace historical
-results where they disagree.
+course has no imported result. It does not simulate finishes or infer missing
+winner data. Use DuckStation-generated records to extend coverage and replace
+historical results where they disagree.
+
+The game takes at least 10 seconds to load the betting screen, so the first 600
+frames after reset were intentionally omitted from the generated dataset. The
+bundled database covers approximately the following hour, from frame 600
+through frame 215,998. C has short-course results only; B, A, and S have both
+long- and short-course results. Frames before 600 and frames without imported
+winners cannot return a result.
+
+The browser searches the full unsigned 32-bit frame-counter cycle
+(2^32 = 4,294,967,296 frames, about 828 days at 60 fps), wrapping from the
+maximum frame back to zero. If no match is found after 24 hours of searched
+frames (5,184,000 frames), it pauses and asks whether to continue, repeating
+the prompt after each additional 24 hours. Winner data is currently available
+only for the generated range described above.
 
 The browser app and artwork are in `webapp/`. The top-level `index.html`
 redirects to the app for convenient folder-level access.

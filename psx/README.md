@@ -23,18 +23,21 @@ Gift selectors default to **Any gift**. Selecting one filters that prize slot;
 any unselected slots are filled from a matching race. Duplicate gift selections
 trigger a confirmation because they may indicate an incorrect observation.
 
-The starting time is converted at 60 frames per second. The search uses the
-assumed 22-bit frame-counter cycle (4,194,304 frames). The green squares are
-suggestions based on speed and jockey
-rank, with Bronze jockeys excluded; they are a heuristic, not a guaranteed
-finish-order prediction.
+The starting time is converted at 60 frames per second. The game counter is an
+unsigned 32-bit value, so searches wrap across the full 2^32-frame cycle
+(4,294,967,296 frames, about 828 days at 60 fps). If no match is found after
+24 hours of searched frames (5,184,000 frames), the page pauses and asks
+whether to continue. It asks again after each additional 24 hours. Searches
+can be stopped at any time. The green squares are suggestions based on speed
+and jockey rank, with Bronze jockeys excluded; they are a heuristic, not a
+guaranteed finish-order prediction.
 
 ## Winnable prize frames
 
 The **Find Winnable Prize Frames** section searches ahead for frames where the
 chosen prize appears on a suggested bet. Its time-before-next-try setting helps
 estimate when to start the next race; qualifying frames are listed as they are
-found.
+found. It also pauses for confirmation after each 24 hours of searched frames.
 
 This folder contains the browser app and artwork. It does not include the
 separate DuckStation development source or build artifacts.
