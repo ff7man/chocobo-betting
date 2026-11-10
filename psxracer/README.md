@@ -12,7 +12,7 @@ PSX Chocobo Racer combines the PlayStation frame finder UI with a local DuckStat
 
 The browser searches the PSX frame sequence for the entered chocobo stats and optional gifts. When it finds a candidate frame, the local service passes the frame to the emulator. DuckStation loads the matching class save state, applies the calibrated frame offset, sets the short or long course, then runs the race at unlimited speed. It reads the six finish positions from game memory and returns the actual top-two chocobo pair plus the full race order. The UI marks the winning pair with `S` or `L`.
 
-This is a direct emulation of the race rather than a winner guess based on speed or jockey color. On the tested Mac setup, the race run returns in under two seconds; duration can vary by computer. It supports any valid PSX counter frame from `0` to `4,194,303`. Class C is configured as short-course only; B, A, and S run both course lengths.
+This is a direct emulation of the race rather than a winner guess based on speed or jockey color. On the tested Mac setup, the race run returns in under two seconds; duration can vary by computer. It supports the full unsigned 32-bit PSX counter range from `0` to `4,294,967,295`, wrapping after `2^32` frames. Class C is configured as short-course only; B, A, and S run both course lengths.
 
 ## Run locally
 

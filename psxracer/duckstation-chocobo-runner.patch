@@ -58,7 +58,7 @@ index 0000000..8d46cc9
 +constexpr u32 RACER_STATUS_BASE = 0x800B763C;
 +constexpr u32 BETTING_SCREEN_CONFIRM_FRAMES = 5;
 +constexpr u32 AUTO_RACE_START_FRAMES = 10;
-+constexpr u32 FRAME_CYCLE = 0x400000;
++constexpr u64 FRAME_CYCLE = 0x100000000ULL;
 +
 +enum class Stage : u8
 +{
@@ -453,13 +453,13 @@ index 0000000..8d46cc9
 +    }
 +  }
 +
-+  const u32 target_frame = use_target_frame ? configured_target_frame : (legacy_frame_value + frame_offset) % FRAME_CYCLE;
++  const u64 target_frame = use_target_frame ? configured_target_frame : (static_cast<u64>(legacy_frame_value) + frame_offset) % FRAME_CYCLE;
 +  if (target_frame >= FRAME_CYCLE)
 +  {
 +    FinishWithError(fmt::format("TargetFrame must be less than the {}-frame cycle.", FRAME_CYCLE));
 +    return;
 +  }
-+  const u32 frame_value = use_target_frame ? (target_frame + FRAME_CYCLE - (frame_offset % FRAME_CYCLE)) % FRAME_CYCLE : legacy_frame_value;
++  const u32 frame_value = use_target_frame ? static_cast<u32>((target_frame + FRAME_CYCLE - frame_offset) % FRAME_CYCLE) : legacy_frame_value;
 +
 +  Error error;
 +  const std::optional<bool> loaded = System::LoadState(state_path.c_str(), &error, false, false);
@@ -505,7 +505,7 @@ index 0000000..8d46cc9
 +           course_width, course_value);
 +
 +  s_patch.frame_value = frame_value;
-+  s_patch.target_frame = target_frame;
++  s_patch.target_frame = static_cast<u32>(target_frame);
 +  s_patch.frame_offset = frame_offset;
 +  s_patch.course_value = course_value;
 +  s_patch.state_path = state_path;
