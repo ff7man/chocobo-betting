@@ -441,28 +441,25 @@ function confirmGiftSelection(criteria){
   }
   return true;
 }
+const RANK_COURSE_INDEX={C:{short:0},B:{short:1,long:2},A:{short:3,long:4},S:{short:5,long:6}};
+function readWinnerPairs(database,frame,rank){
+  if(frame<database.startSeed||frame>=database.endSeedExclusive)throw new Error(`Frame ${frame.toLocaleString()} is outside the current database (${database.startSeed.toLocaleString()}–${(database.endSeedExclusive-1).toLocaleString()}).`);
+  const races=[];
+  for(const course of ['short','long']){
+    const courseIndex=RANK_COURSE_INDEX[rank][course];
+    if(courseIndex===undefined)continue;
+    const bitOffset=(frame-database.startSeed)*28+courseIndex*4;
+    const byteOffset=12+Math.floor(bitOffset/8),bitShift=bitOffset%8;
+    const pairCode=((database.bytes[byteOffset]|(database.bytes[byteOffset+1]<<8))>>>bitShift)&0xF;
+    if(pairCode!==0xF)races.push({course,winner_pair:BET_PAIRS[pairCode]});
+  }
+  return races;
+}
 async function requestEmulatorResults(frame,rank){
   try{
     setBanner('searching','Looking up cached race results','Reading the aligned winner database…');
-    const {view,metadata}=await loadWinnerDatabase();
-    const bytes=new Uint8Array(view.buffer,view.byteOffset,view.byteLength);
-    const magic=String.fromCharCode(...bytes.slice(0,6));
-    if(magic!=='PSCDB3')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
-    const startSeed=view.getUint32(8,true),payloadBytes=bytes.length-12;
-    const frameCount=Math.floor(payloadBytes*8/28);
-    if(frameCount<=0||Math.ceil(frameCount*28/8)!==payloadBytes)throw new Error('Winner database has an invalid packed frame length. Rebuild it with build_db.py.');
-    const maxSeedExclusive=startSeed+frameCount;
-    if(frame<startSeed||frame>=maxSeedExclusive)throw new Error(`Frame ${frame.toLocaleString()} is outside the current database (${startSeed.toLocaleString()}–${(maxSeedExclusive-1).toLocaleString()}).`);
-    const rankCourseIndex={C:{short:0},B:{short:1,long:2},A:{short:3,long:4},S:{short:5,long:6}};
-    const races=[];
-    for(const course of ['short','long']){
-      const courseIndex=rankCourseIndex[rank][course];
-      if(courseIndex===undefined)continue;
-      const bitOffset=(frame-startSeed)*28+courseIndex*4;
-      const byteOffset=12+Math.floor(bitOffset/8),bitShift=bitOffset%8;
-      const pairCode=((bytes[byteOffset]|(bytes[byteOffset+1]<<8))>>>bitShift)&0xF;
-      if(pairCode!==0xF)races.push({course,winner_pair:BET_PAIRS[pairCode]});
-    }
+    const database=await loadWinnerDatabase(),{metadata}=database;
+    const races=readWinnerPairs(database,frame,rank);
     document.querySelectorAll('.race-course-marks').forEach(marks=>marks.remove());
     const summary=[];
     for(const race of races){
@@ -498,7 +495,12 @@ async function loadWinnerDatabase(){
       const winnerFile=archive.file('winners.bin');
       if(!winnerFile)throw new Error('The ZIP archive does not contain winners.bin. Rebuild it with build_db.py.');
       const buffer=await winnerFile.async('arraybuffer');
-      return {view:new DataView(buffer),metadata};
+      const view=new DataView(buffer),bytes=new Uint8Array(buffer);
+      if(String.fromCharCode(...bytes.slice(0,6))!=='PSCDB3')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
+      const startSeed=view.getUint32(8,true),payloadBytes=bytes.length-12;
+      const frameCount=Math.floor(payloadBytes*8/28);
+      if(frameCount<=0||Math.ceil(frameCount*28/8)!==payloadBytes)throw new Error('Winner database has an invalid packed frame length. Rebuild it with build_db.py.');
+      return {view,bytes,metadata,startSeed,frameCount,endSeedExclusive:startSeed+frameCount};
     })().catch(error=>{winnerDatabasePromise=null;throw error;});
   }
   return winnerDatabasePromise;
@@ -638,44 +640,62 @@ huntButton.addEventListener('click',async()=>{
   const rank=huntRankSelect.value,targetPrize=Number(huntPrizeSelect.value),initialWaitFrames=Number(document.querySelector('#hunt-step').value)*60,wanted=10;
   huntCancel=false;huntRunning=true;huntResults.replaceChildren();
   huntButton.textContent='Stop search';huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=true;
-  huntStatus.textContent=`Waiting ${document.querySelector('#hunt-step').value} seconds, then searching for ${PRIZE_NAMES[targetPrize]}…`;
-  let checked=0,found=0,pausedForConfirmation=false;
-  while(checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation){
-    const batchStart=performance.now();
-    do{
-      const currentOffset=initialWaitFrames+checked;
-      const frame=(start+currentOffset)%FRAME_CYCLE;
-      const race=generateRaceData(frame,rank);
-      const slot=race.items.indexOf(targetPrize);
-      checked++;
-      if(slot!==-1){
-        const winningPairs=predictWinnerBets(race).pairs.filter(pair=>race.tileCards[BET_PAIRS.indexOf(pair)]===slot);
-        if(winningPairs.length){
-          found++;
-          const elapsedLabel=formatClock(currentOffset);
-          const row=document.createElement('li');
-          const frameLabel=document.createElement('strong');frameLabel.textContent=`Frame ${frame.toLocaleString()}`;
-          latestDiscoveredFrame=frame;
-          document.querySelector('#new-race-button').disabled=false;
-          huntFrameInput.value=String(frame);
-          row.append(frameLabel,document.createTextNode(` · ${formatClock(frame)} · +${elapsedLabel} after starting frame · Prize: ${PRIZE_NAMES[targetPrize]} · Green bet`));
-          winningPairs.forEach(pair=>{const bet=document.createElement('span');bet.className='hunt-bet';bet.textContent=pair;row.append(bet);});
-          huntResults.append(row);
+  huntStatus.textContent=`Loading actual ${rank} race winners for ${PRIZE_NAMES[targetPrize]}…`;
+  let checked=0,found=0,database,loadError=null;
+  try{database=await loadWinnerDatabase();}
+  catch(error){loadError=error;}
+  const rankData=database?.metadata.ranks?.[rank],coverage=rankData?.seedRange;
+  if(loadError){
+    huntStatus.textContent=`Could not load actual winner data: ${loadError.message}`;
+  }else if(!coverage){
+    huntStatus.textContent=`No actual winner data is available for Class ${rank}. This search does not use predicted bets.`;
+  }else{
+    const coverageStart=Math.max(database.startSeed,Number(coverage[0]));
+    const coverageEnd=Math.min(database.endSeedExclusive-1,Number(coverage[1]));
+    if(coverageStart>coverageEnd){
+      huntStatus.textContent=`No actual winner data is available for Class ${rank} in the current database.`;
+    }else{
+      const firstFrame=(start+initialWaitFrames)%FRAME_CYCLE;
+      const spans=[];
+      const firstSpanStart=Math.max(firstFrame,coverageStart);
+      if(firstSpanStart<=coverageEnd)spans.push([firstSpanStart,coverageEnd]);
+      const wrappedSpanEnd=Math.min(coverageEnd,firstFrame-1);
+      if(coverageStart<=wrappedSpanEnd)spans.push([coverageStart,wrappedSpanEnd]);
+      const totalToCheck=spans.reduce((sum,[from,to])=>sum+to-from+1,0);
+      let batchStart=performance.now();
+      for(const [spanStart,spanEnd] of spans){
+        for(let frame=spanStart;frame<=spanEnd&&!huntCancel&&found<wanted;frame++){
+          const race=generateRaceData(frame,rank),slot=race.items.indexOf(targetPrize);
+          checked++;
+          if(slot!==-1){
+            const actualWinners=readWinnerPairs(database,frame,rank);
+            const winningRaces=actualWinners.filter(({winner_pair})=>race.tileCards[BET_PAIRS.indexOf(winner_pair)]===slot);
+            if(winningRaces.length){
+              found++;
+              const elapsed=initialWaitFrames+(frame-firstFrame+FRAME_CYCLE)%FRAME_CYCLE;
+              const row=document.createElement('li');
+              const frameLabel=document.createElement('strong');frameLabel.textContent=`Frame ${frame.toLocaleString()}`;
+              latestDiscoveredFrame=frame;
+              document.querySelector('#new-race-button').disabled=false;
+              huntFrameInput.value=String(frame);
+              row.append(frameLabel,document.createTextNode(` · ${formatClock(frame)} · +${formatClock(elapsed)} after starting frame · Prize: ${PRIZE_NAMES[targetPrize]} · Actual winner`));
+              winningRaces.forEach(({course,winner_pair})=>{const bet=document.createElement('span');bet.className='hunt-bet';bet.textContent=`${course==='long'?'L':'S'} ${winner_pair}`;bet.title=`Actual ${course} race winning bet`;row.append(bet);});
+              huntResults.append(row);
+            }
+          }
+          if(performance.now()-batchStart>=14){
+            huntStatus.textContent=`${found}/${wanted} found · checked ${checked.toLocaleString()} of ${totalToCheck.toLocaleString()} stored frames · actual data ${coverageStart.toLocaleString()}–${coverageEnd.toLocaleString()}`;
+            await yieldFrame();batchStart=performance.now();
+          }
         }
+        if(huntCancel||found>=wanted)break;
       }
-      if(checked<FRAME_CYCLE&&checked%SEARCH_CONFIRM_INTERVAL===0){
-        huntStatus.textContent=`Paused after ${formatClock(checked)} of searching · ${found} tryable frame${found===1?'':'s'} found.`;
-        if(!confirmContinueSearch(checked,found)){pausedForConfirmation=true;break;}
-      }
-    }while(performance.now()-batchStart<14&&checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation);
-    huntStatus.textContent=`${found}/${wanted} found · checked ${checked.toLocaleString()} frames · next scan at ${((start+initialWaitFrames+checked)%FRAME_CYCLE).toLocaleString()}`;
-    if(checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation)await yieldFrame();
+      if(huntCancel)huntStatus.textContent=`Stopped · found ${found} using actual winners · checked ${checked.toLocaleString()} stored frames.`;
+      else if(found===wanted)huntStatus.textContent=`Found the next ${wanted} potentially winnable frames with your prize using actual race winners.`;
+      else huntStatus.textContent=`Checked ${checked.toLocaleString()} stored frames (${coverageStart.toLocaleString()}–${coverageEnd.toLocaleString()}) · found ${found} actual winning bet${found===1?'':'s'}. No predicted bets were used.`;
+    }
   }
   huntRunning=false;huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=false;
   huntButton.disabled=false;huntButton.textContent='Find next 10';
-  if(huntCancel)huntStatus.textContent=`Stopped · found ${found} · checked ${checked.toLocaleString()} frames.`;
-  else if(pausedForConfirmation)huntStatus.textContent=`Paused at your request · found ${found} · checked ${checked.toLocaleString()} frames.`;
-  else if(found===wanted)huntStatus.textContent=`Found the next ${wanted} potentially winnable frames with your prize`;
-  else huntStatus.textContent=`Searched a full 2^32-frame cycle after the initial wait · found ${found} tryable frame${found===1?'':'s'} after checking ${checked.toLocaleString()} frames.`;
 });
 
