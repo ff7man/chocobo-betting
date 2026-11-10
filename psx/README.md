@@ -9,7 +9,9 @@ bet pairs based on top speed and jockey rank.
 ## Open it
 
 Open `index.html` in a browser or serve this folder with any static web server.
-The published version is at <https://ff7man.github.io/psx/>.
+For the WebAssembly accelerator, serve the folder over HTTP; opening with
+`file://` falls back to the JavaScript scanner. The published version is at
+<https://ff7man.github.io/psx/>.
 
 ## Search for a race
 
@@ -31,6 +33,15 @@ whether to continue. It asks again after each additional 24 hours. Searches
 can be stopped at any time. The green squares are suggestions based on speed
 and jockey rank, with Bronze jockeys excluded; they are a heuristic, not a
 guaranteed finish-order prediction.
+
+The frame search uses `race_search.c` compiled to `race-search.wasm` to check
+candidate seeds, then uses JavaScript to build the complete race after a match.
+To rebuild the module with Emscripten, run:
+
+```sh
+emcc race_search.c -O3 -s STANDALONE_WASM=1 -Wl,--no-entry \
+  -Wl,--export=scan -Wl,--export-memory -o race-search.wasm
+```
 
 ## Winnable prize frames
 

@@ -19,6 +19,7 @@ const AI_JOCKEY_COLORS=[
 // The game stores this counter as an unsigned 32-bit value.
 const FRAME_CYCLE = 0x100000000;
 const SEARCH_CONFIRM_INTERVAL = 5184000; // 24 hours at 60 frames per second.
+const WASM_BATCH_SIZE = 1048576;
 const form = document.querySelector('#search-form');
 const rankSelect = document.querySelector('#rank');
 const speedSelect = document.querySelector('#speed');
@@ -345,6 +346,27 @@ function confirmContinueSearch(frames,foundCount=null){
   const progress=foundCount===null?'No matching race has been found yet.':`Found ${foundCount} potentially winnable frame${foundCount===1?'':'s'} so far.`;
   return window.confirm(`${progress} Searched ${frames.toLocaleString()} frames (${formatClock(frames)} at 60 fps). Continue searching?`);
 }
+let raceSearchWasmPromise=null;
+async function loadRaceSearchWasm(){
+  if(typeof WebAssembly==='undefined'||location.protocol==='file:')return null;
+  if(!raceSearchWasmPromise){
+    raceSearchWasmPromise=fetch('race-search.wasm')
+      .then(response=>{if(!response.ok)throw new Error('WASM scanner unavailable');return response.arrayBuffer();})
+      .then(bytes=>WebAssembly.instantiate(bytes))
+      .then(({instance})=>instance.exports.scan)
+      .catch(()=>null);
+  }
+  return raceSearchWasmPromise;
+}
+function findMatchInJavaScriptBatch(start,count,criteria,rank){
+  for(let offset=0;offset<count;offset++){
+    const frame=(start+offset)%FRAME_CYCLE;
+    const race=generateRaceData(frame,rank);
+    if(matches(race,criteria))return offset+1;
+  }
+  return 0;
+}
+
 function setBanner(kind,title,detail){resultBanner.className=`result-banner ${kind?`is-${kind}`:''}`;document.querySelector('#result-status').textContent=title;document.querySelector('#result-detail').textContent=detail;document.querySelector('#banner-mark').textContent=kind==='searching'?'◌':kind==='success'?'✓':kind==='error'?'!':'↳';}
 function renderDefaultClass(){
   document.body.dataset.rank=rankSelect.value;
@@ -484,21 +506,47 @@ async function scanFrom(start,criteria,rank){
   document.querySelector('#race-list').innerHTML='<div class="empty-state"><span class="empty-orbit">✳</span><strong>Scanning generated race data</strong><span>Starting at frame '+firstFrame.toLocaleString()+'</span></div>';
   const hasGiftFilters=criteria.prizes.some(prize=>prize!==null);
   setBanner('searching','Searching from frame '+firstFrame.toLocaleString(),hasGiftFilters?'Checking chocobo details and selected gifts.':'Checking chocobo details; gifts will be filled from each match.');
+  const wasmScan=await loadRaceSearchWasm();
+  const rankIndex={C:0,B:1,A:2,S:3}[rank];
+  const targetName=RACER_NAMES.indexOf(criteria.name);
+  const targetPrizes=criteria.prizes.map(prize=>prize===null?-1:prize);
   let frame=firstFrame,attempts=0,found=null,pausedForConfirmation=false;
-  while(!cancelSearch && attempts<FRAME_CYCLE) {
-    const batchStart=performance.now();
-    do {
-      frame=(firstFrame+attempts)%FRAME_CYCLE;
-      const race=generateRaceData(frame,rank);
-      if(matches(race,criteria)){found={race,frame};break;}
-      attempts++;
-      if(attempts<FRAME_CYCLE&&attempts%SEARCH_CONFIRM_INTERVAL===0){
-        setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Searched ${formatClock(attempts)} at 60 fps. Pausing for confirmation.`);
-        if(!confirmContinueSearch(attempts)){pausedForConfirmation=true;break;}
-      }
-    } while(performance.now()-batchStart<14 && !cancelSearch && attempts<FRAME_CYCLE);
-    if(found||cancelSearch||pausedForConfirmation)break;
-    if(attempts>0&&attempts%2400<180) setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Currently at frame ${frame.toLocaleString()} · ${formatClock(frame)} since reset.`);
+  while(!cancelSearch&&attempts<FRAME_CYCLE){
+    if(wasmScan){
+      const untilConfirmation=SEARCH_CONFIRM_INTERVAL-(attempts%SEARCH_CONFIRM_INTERVAL);
+      const count=Math.min(WASM_BATCH_SIZE,FRAME_CYCLE-attempts,untilConfirmation);
+      const batchStart=(firstFrame+attempts)%FRAME_CYCLE;
+      const offset=wasmScan(batchStart,count,rankIndex,criteria.speed,criteria.stamina,targetName,...targetPrizes);
+      if(offset){
+        frame=(batchStart+offset-1)%FRAME_CYCLE;
+        let race=generateRaceData(frame,rank);
+        if(matches(race,criteria)){
+          found={race,frame};attempts+=offset;
+        }else{
+          const remaining=count-offset,nextStart=(frame+1)%FRAME_CYCLE;
+          const fallbackOffset=findMatchInJavaScriptBatch(nextStart,remaining,criteria,rank);
+          if(fallbackOffset){
+            frame=(nextStart+fallbackOffset-1)%FRAME_CYCLE;
+            race=generateRaceData(frame,rank);found={race,frame};attempts+=offset+fallbackOffset;
+          }else attempts+=count;
+        }
+      }else attempts+=count;
+    }else{
+      const batchStart=performance.now();
+      do{
+        frame=(firstFrame+attempts)%FRAME_CYCLE;
+        const race=generateRaceData(frame,rank);
+        if(matches(race,criteria)){found={race,frame};attempts++;break;}
+        attempts++;
+      }while(performance.now()-batchStart<14&&!cancelSearch&&attempts<FRAME_CYCLE&&attempts%SEARCH_CONFIRM_INTERVAL!==0);
+    }
+    if(found||cancelSearch)break;
+    if(attempts>0&&attempts%SEARCH_CONFIRM_INTERVAL===0&&attempts<FRAME_CYCLE){
+      setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Searched ${formatClock(attempts)} at 60 fps. Pausing for confirmation.`);
+      if(!confirmContinueSearch(attempts)){pausedForConfirmation=true;break;}
+    }else if(attempts>0){
+      setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Currently at frame ${frame.toLocaleString()} · ${formatClock(frame)} since reset.`);
+    }
     await yieldFrame();
   }
   searchButton.disabled=false;searchButton.setAttribute('aria-label','Find matching frame');searchButton.textContent='▶';cancelButton.hidden=true;
@@ -521,6 +569,7 @@ async function scanFrom(start,criteria,rank){
     setBanner('error','No match found',`Scanned the full 2^32-frame cycle (~${formatSearchEstimate(attempts)}). Check PS data.`);
   }
 }
+
 form.addEventListener('submit',event=>{
   event.preventDefault();
   const criteria=collectCriteria();
