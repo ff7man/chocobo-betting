@@ -63,5 +63,14 @@ frames (5,184,000 frames), it pauses and asks whether to continue, repeating
 the prompt after each additional 24 hours. Winner data is currently available
 only for the generated range described above.
 
+Frame matching uses the included `webapp/race_search.c` compiled to
+`webapp/race-search.wasm`; JavaScript builds the full race when a seed matches.
+To rebuild the module with Emscripten, run this from `webapp/`:
+
+```sh
+emcc race_search.c -O3 -s STANDALONE_WASM=1 -Wl,--no-entry \
+  -Wl,--export=scan -Wl,--export-memory -o race-search.wasm
+```
+
 The browser app and artwork are in `webapp/`. The top-level `index.html`
 redirects to the app for convenient folder-level access.
