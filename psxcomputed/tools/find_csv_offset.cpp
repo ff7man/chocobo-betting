@@ -66,11 +66,11 @@ int main(int argc, char** argv)
     csv_frame=std::stoi(c[16]);
   }
   if (count!=6) { std::cerr << "Could not read first six racer rows from " << argv[1] << "\n"; return 1; }
-  constexpr uint32_t cycle=0x400000;
+  constexpr uint64_t cycle=uint64_t{1} << 32;
   int matches=0;
-  for (uint32_t seed=0; seed<cycle; seed++)
+  for (uint64_t seed=0; seed<cycle; seed++)
   {
-    uint32_t state=seed;
+    uint32_t state=static_cast<uint32_t>(seed);
     for (int i=0;i<0x28;i++) { Next(state); Next(state); }
     std::array<Stats,6> expected{};
     bool stats_match=true;
@@ -100,7 +100,7 @@ int main(int argc, char** argv)
     for (int i=0;i<6;i++) if (rows[i].name!=NAMES[names[i]]) names_match=false;
     if (!names_match) continue;
 
-    const uint32_t offset=(seed + cycle - (static_cast<uint32_t>(csv_frame)%cycle))%cycle;
+    const uint32_t offset=static_cast<uint32_t>((seed + cycle - static_cast<uint32_t>(csv_frame))%cycle);
     std::cout << "match seed=" << seed << " csv_frame=" << csv_frame << " offset=" << offset << "\n";
     matches++;
   }

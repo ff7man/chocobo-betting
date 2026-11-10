@@ -16,8 +16,9 @@ const AI_JOCKEY_COLORS=[
   {label:'Bronze',color:'#a96e3c'},
   {label:'Platinum',color:'#85878a'}
 ];
-// The game's frame counter appears to wrap at 0x400000 (2^22).
-const FRAME_CYCLE = 0x400000;
+// The game stores this counter as an unsigned 32-bit value.
+const FRAME_CYCLE = 0x100000000;
+const SEARCH_CONFIRM_INTERVAL = 5184000; // 24 hours at 60 frames per second.
 const form = document.querySelector('#search-form');
 const rankSelect = document.querySelector('#rank');
 const speedSelect = document.querySelector('#speed');
@@ -340,6 +341,10 @@ function startFrameFromTime() {
 ['hours','minutes','seconds'].forEach(id=>document.querySelector(`#${id}`).addEventListener('input',()=>{exactStartFrameOverride=null;}));
 function formatClock(frame) {const totalSeconds=Math.floor(frame/60),h=Math.floor(totalSeconds/3600),m=Math.floor(totalSeconds%3600/60),s=totalSeconds%60;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;}
 function formatSearchEstimate(frames) {const totalMinutes=Math.floor(frames/3600),hours=Math.floor(totalMinutes/60),minutes=totalMinutes%60;return hours?`${hours}h ${String(minutes).padStart(2,'0')}m`:`${minutes}m`;}
+function confirmContinueSearch(frames,foundCount=null){
+  const progress=foundCount===null?'No matching race has been found yet.':`Found ${foundCount} potentially winnable frame${foundCount===1?'':'s'} so far.`;
+  return window.confirm(`${progress} Searched ${frames.toLocaleString()} frames (${formatClock(frames)} at 60 fps). Continue searching?`);
+}
 function setBanner(kind,title,detail){resultBanner.className=`result-banner ${kind?`is-${kind}`:''}`;document.querySelector('#result-status').textContent=title;document.querySelector('#result-detail').textContent=detail;document.querySelector('#banner-mark').textContent=kind==='searching'?'◌':kind==='success'?'✓':kind==='error'?'!':'↳';}
 function renderDefaultClass(){
   document.body.dataset.rank=rankSelect.value;
@@ -473,20 +478,26 @@ async function loadWinnerDatabase(){
   return winnerDatabasePromise;
 }
 async function scanFrom(start,criteria,rank){
+  const firstFrame=((Math.trunc(start)%FRAME_CYCLE)+FRAME_CYCLE)%FRAME_CYCLE;
   cancelSearch=false;searchButton.disabled=true;searchButton.setAttribute('aria-label','Searching');searchButton.textContent='…';cancelButton.hidden=false;
   keepSearchingButton.hidden=true;lastFoundFrame=null;
-  document.querySelector('#race-list').innerHTML='<div class="empty-state"><span class="empty-orbit">✳</span><strong>Scanning generated race data</strong><span>Starting at frame '+start.toLocaleString()+'</span></div>';
+  document.querySelector('#race-list').innerHTML='<div class="empty-state"><span class="empty-orbit">✳</span><strong>Scanning generated race data</strong><span>Starting at frame '+firstFrame.toLocaleString()+'</span></div>';
   const hasGiftFilters=criteria.prizes.some(prize=>prize!==null);
-  setBanner('searching','Searching from frame '+start.toLocaleString(),hasGiftFilters?'Checking chocobo details and selected gifts.':'Checking chocobo details; gifts will be filled from each match.');
-  let frame=start,attempts=0,found=null;
-  while(!cancelSearch && frame<FRAME_CYCLE) {
+  setBanner('searching','Searching from frame '+firstFrame.toLocaleString(),hasGiftFilters?'Checking chocobo details and selected gifts.':'Checking chocobo details; gifts will be filled from each match.');
+  let frame=firstFrame,attempts=0,found=null,pausedForConfirmation=false;
+  while(!cancelSearch && attempts<FRAME_CYCLE) {
     const batchStart=performance.now();
     do {
+      frame=(firstFrame+attempts)%FRAME_CYCLE;
       const race=generateRaceData(frame,rank);
       if(matches(race,criteria)){found={race,frame};break;}
-      frame++;attempts++;
-    } while(performance.now()-batchStart<14 && !cancelSearch && frame<FRAME_CYCLE);
-    if(found||cancelSearch)break;
+      attempts++;
+      if(attempts<FRAME_CYCLE&&attempts%SEARCH_CONFIRM_INTERVAL===0){
+        setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Searched ${formatClock(attempts)} at 60 fps. Pausing for confirmation.`);
+        if(!confirmContinueSearch(attempts)){pausedForConfirmation=true;break;}
+      }
+    } while(performance.now()-batchStart<14 && !cancelSearch && attempts<FRAME_CYCLE);
+    if(found||cancelSearch||pausedForConfirmation)break;
     if(attempts>0&&attempts%2400<180) setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Currently at frame ${frame.toLocaleString()} · ${formatClock(frame)} since reset.`);
     await yieldFrame();
   }
@@ -499,14 +510,15 @@ async function scanFrom(start,criteria,rank){
     huntRankSelect.value=rank;
     updateHuntPrizes();
     found.race.items.forEach((item,index)=>{prizeSelects[index].value=String(item);syncCustomDropdown(prizeSelects[index]);});
-    lastFoundFrame=found.frame;keepSearchingButton.hidden=found.frame+1>=FRAME_CYCLE;
+    lastFoundFrame=found.frame;keepSearchingButton.hidden=false;
     setBanner('success','Race data matched',`${found.race.names[0]} · ${PRIZE_NAMES[found.race.items[0]]} / ${PRIZE_NAMES[found.race.items[1]]} / ${PRIZE_NAMES[found.race.items[2]]}`);
     await requestEmulatorResults(found.frame,rank);
   }
   else if(cancelSearch){setBanner('',`Search stopped`,`Checked ${attempts.toLocaleString()} frames. Adjust your start time or race details and try again.`);}
+  else if(pausedForConfirmation){setBanner('',`Search paused`,`No match after ${formatClock(attempts)} of searching. Start a new search to continue from another time.`);}
   else {
     document.querySelector('#race-list').innerHTML='<div class="empty-state"><strong>No matching frame found</strong><span>Check the PlayStation class, chocobo stats, prizes, and time since power reset.</span></div>';
-    setBanner('error','No match found',`Scanned ~${formatSearchEstimate(attempts)} · Check PS data.`);
+    setBanner('error','No match found',`Scanned the full 2^32-frame cycle (~${formatSearchEstimate(attempts)}). Check PS data.`);
   }
 }
 form.addEventListener('submit',event=>{
@@ -519,7 +531,7 @@ keepSearchingButton.addEventListener('click',()=>{
   if(lastFoundFrame===null)return;
   const criteria=collectCriteria();
   if(!confirmGiftSelection(criteria))return;
-  scanFrom(lastFoundFrame+1,criteria,rankSelect.value);
+  scanFrom((lastFoundFrame+1)%FRAME_CYCLE,criteria,rankSelect.value);
 });
 cancelButton.addEventListener('click',()=>{cancelSearch=true;cancelButton.disabled=true;cancelButton.textContent='Stopping…';setTimeout(()=>{cancelButton.disabled=false;cancelButton.textContent='Stop search';},200);});
 
@@ -574,8 +586,8 @@ huntButton.addEventListener('click',async()=>{
   huntCancel=false;huntRunning=true;huntResults.replaceChildren();
   huntButton.textContent='Stop search';huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=true;
   huntStatus.textContent=`Waiting ${document.querySelector('#hunt-step').value} seconds, then searching for ${PRIZE_NAMES[targetPrize]}…`;
-  let checked=0,found=0;
-  while(checked<FRAME_CYCLE&&found<wanted&&!huntCancel){
+  let checked=0,found=0,pausedForConfirmation=false;
+  while(checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation){
     const batchStart=performance.now();
     do{
       const currentOffset=initialWaitFrames+checked;
@@ -598,14 +610,19 @@ huntButton.addEventListener('click',async()=>{
           huntResults.append(row);
         }
       }
-    }while(performance.now()-batchStart<14&&checked<FRAME_CYCLE&&found<wanted&&!huntCancel);
+      if(checked<FRAME_CYCLE&&checked%SEARCH_CONFIRM_INTERVAL===0){
+        huntStatus.textContent=`Paused after ${formatClock(checked)} of searching · ${found} tryable frame${found===1?'':'s'} found.`;
+        if(!confirmContinueSearch(checked,found)){pausedForConfirmation=true;break;}
+      }
+    }while(performance.now()-batchStart<14&&checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation);
     huntStatus.textContent=`${found}/${wanted} found · checked ${checked.toLocaleString()} frames · next scan at ${((start+initialWaitFrames+checked)%FRAME_CYCLE).toLocaleString()}`;
-    if(checked<FRAME_CYCLE&&found<wanted&&!huntCancel)await yieldFrame();
+    if(checked<FRAME_CYCLE&&found<wanted&&!huntCancel&&!pausedForConfirmation)await yieldFrame();
   }
   huntRunning=false;huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=false;
   huntButton.disabled=false;huntButton.textContent='Find next 10';
   if(huntCancel)huntStatus.textContent=`Stopped · found ${found} · checked ${checked.toLocaleString()} frames.`;
+  else if(pausedForConfirmation)huntStatus.textContent=`Paused at your request · found ${found} · checked ${checked.toLocaleString()} frames.`;
   else if(found===wanted)huntStatus.textContent=`Found the next ${wanted} potentially winnable frames with your prize`;
-  else huntStatus.textContent=`Searched a full frame cycle after the initial wait · found ${found} tryable frame${found===1?'':'s'} after checking ${checked.toLocaleString()} frames.`;
+  else huntStatus.textContent=`Searched a full 2^32-frame cycle after the initial wait · found ${found} tryable frame${found===1?'':'s'} after checking ${checked.toLocaleString()} frames.`;
 });
 
