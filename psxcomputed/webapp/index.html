@@ -66,8 +66,8 @@
 
         <section class="prize-hunt" aria-labelledby="prize-hunt-title">
           <h2 id="prize-hunt-title">Find Winnable Prize Frames</h2>
-          <p>Look ahead and find frames where the selected prize is on an actual winning bet.</p>
-          <p class="database-coverage">Uses recorded short and long race winners only. Current coverage is frames 600–215,998 (about the first hour after reset) for classes C, B, A, and S; frames without stored results are skipped, never guessed.</p>
+          <p>Look ahead for frames where the selected prize appears on an actual winning bet or a best-guess bet.</p>
+          <p class="database-coverage">Uses recorded short and long race winners when available (currently frames 600–215,998). Outside that cache, it falls back to the old best-guess method: top speed and jockey rank, with Bronze jockeys excluded.</p>
           <div class="prize-hunt-controls">
             <label>Starting frame<input id="hunt-frame" type="number" min="0" max="4294967295" step="1" value="0" /></label>
             <label>Class<select id="hunt-rank"><option value="C">C</option><option value="B" selected>B</option><option value="A">A</option><option value="S">S</option></select></label>

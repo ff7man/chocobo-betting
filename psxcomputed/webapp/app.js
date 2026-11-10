@@ -455,6 +455,11 @@ function readWinnerPairs(database,frame,rank){
   }
   return races;
 }
+function getCachedWinnerPairs(database,frame,rank){
+  const seedRange=database?.metadata.ranks?.[rank]?.seedRange;
+  if(!seedRange||frame<Number(seedRange[0])||frame>Number(seedRange[1])||frame<database.startSeed||frame>=database.endSeedExclusive)return null;
+  return readWinnerPairs(database,frame,rank);
+}
 async function requestEmulatorResults(frame,rank){
   try{
     setBanner('searching','Looking up cached race results','Reading the aligned winner database…');
@@ -640,61 +645,68 @@ huntButton.addEventListener('click',async()=>{
   const rank=huntRankSelect.value,targetPrize=Number(huntPrizeSelect.value),initialWaitFrames=Number(document.querySelector('#hunt-step').value)*60,wanted=10;
   huntCancel=false;huntRunning=true;huntResults.replaceChildren();
   huntButton.textContent='Stop search';huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=true;
-  huntStatus.textContent=`Loading actual ${rank} race winners for ${PRIZE_NAMES[targetPrize]}…`;
-  let checked=0,found=0,database,loadError=null;
+  huntStatus.textContent=`Loading cached ${rank} race winners for ${PRIZE_NAMES[targetPrize]}…`;
+  let checked=0,found=0,database=null;
   try{database=await loadWinnerDatabase();}
-  catch(error){loadError=error;}
-  const rankData=database?.metadata.ranks?.[rank],coverage=rankData?.seedRange;
-  if(loadError){
-    huntStatus.textContent=`Could not load actual winner data: ${loadError.message}`;
-  }else if(!coverage){
-    huntStatus.textContent=`No actual winner data is available for Class ${rank}. This search does not use predicted bets.`;
-  }else{
-    const coverageStart=Math.max(database.startSeed,Number(coverage[0]));
-    const coverageEnd=Math.min(database.endSeedExclusive-1,Number(coverage[1]));
-    if(coverageStart>coverageEnd){
-      huntStatus.textContent=`No actual winner data is available for Class ${rank} in the current database.`;
-    }else{
-      const firstFrame=(start+initialWaitFrames)%FRAME_CYCLE;
-      const spans=[];
-      const firstSpanStart=Math.max(firstFrame,coverageStart);
-      if(firstSpanStart<=coverageEnd)spans.push([firstSpanStart,coverageEnd]);
-      const wrappedSpanEnd=Math.min(coverageEnd,firstFrame-1);
-      if(coverageStart<=wrappedSpanEnd)spans.push([coverageStart,wrappedSpanEnd]);
-      const totalToCheck=spans.reduce((sum,[from,to])=>sum+to-from+1,0);
-      let batchStart=performance.now();
-      for(const [spanStart,spanEnd] of spans){
-        for(let frame=spanStart;frame<=spanEnd&&!huntCancel&&found<wanted;frame++){
-          const race=generateRaceData(frame,rank),slot=race.items.indexOf(targetPrize);
-          checked++;
-          if(slot!==-1){
-            const actualWinners=readWinnerPairs(database,frame,rank);
-            const winningRaces=actualWinners.filter(({winner_pair})=>race.tileCards[BET_PAIRS.indexOf(winner_pair)]===slot);
-            if(winningRaces.length){
-              found++;
-              const elapsed=initialWaitFrames+(frame-firstFrame+FRAME_CYCLE)%FRAME_CYCLE;
-              const row=document.createElement('li');
-              const frameLabel=document.createElement('strong');frameLabel.textContent=`Frame ${frame.toLocaleString()}`;
-              latestDiscoveredFrame=frame;
-              document.querySelector('#new-race-button').disabled=false;
-              huntFrameInput.value=String(frame);
-              row.append(frameLabel,document.createTextNode(` · ${formatClock(frame)} · +${formatClock(elapsed)} after starting frame · Prize: ${PRIZE_NAMES[targetPrize]} · Actual winner`));
-              winningRaces.forEach(({course,winner_pair})=>{const bet=document.createElement('span');bet.className='hunt-bet';bet.textContent=`${course==='long'?'L':'S'} ${winner_pair}`;bet.title=`Actual ${course} race winning bet`;row.append(bet);});
-              huntResults.append(row);
-            }
-          }
-          if(performance.now()-batchStart>=14){
-            huntStatus.textContent=`${found}/${wanted} found · checked ${checked.toLocaleString()} of ${totalToCheck.toLocaleString()} stored frames · actual data ${coverageStart.toLocaleString()}–${coverageEnd.toLocaleString()}`;
-            await yieldFrame();batchStart=performance.now();
-          }
+  catch(error){console.warn('Cached winners unavailable; using best-guess bets for the search.',error);}
+  const firstFrame=(start+initialWaitFrames)%FRAME_CYCLE;
+  const coverage=database?.metadata.ranks?.[rank]?.seedRange;
+  const coverageStart=coverage?Math.max(database.startSeed,Number(coverage[0])):null;
+  const coverageEnd=coverage?Math.min(database.endSeedExclusive-1,Number(coverage[1])):null;
+  const hasCache=coverageStart!==null&&coverageStart<=coverageEnd;
+  let batchStart=performance.now(),usedBestGuess=false,usedActual=false,pausedForConfirmation=false;
+  huntStatus.textContent=hasCache
+    ?`Searching all frames · actual winners cached for ${coverageStart.toLocaleString()}–${coverageEnd.toLocaleString()}, best guesses elsewhere.`
+    :'Cached winners unavailable for this class; searching with best-guess bets based on top speed and jockey rank.';
+  while(checked<FRAME_CYCLE&&found<wanted&&!huntCancel){
+    const frame=(firstFrame+checked)%FRAME_CYCLE;
+    const race=generateRaceData(frame,rank),slot=race.items.indexOf(targetPrize);
+    checked++;
+    if(slot!==-1){
+      const cachedWinners=getCachedWinnerPairs(database,frame,rank);
+      let winningRaces=[];
+      if(cachedWinners!==null){
+        winningRaces=cachedWinners.filter(({winner_pair})=>race.tileCards[BET_PAIRS.indexOf(winner_pair)]===slot);
+        usedActual=true;
+      }else{
+        const guessedPairs=predictWinnerBets(race).pairs.filter(pair=>race.tileCards[BET_PAIRS.indexOf(pair)]===slot);
+        if(guessedPairs.length){
+          winningRaces=guessedPairs.map(winner_pair=>({course:'guess',winner_pair}));
+          usedBestGuess=true;
         }
-        if(huntCancel||found>=wanted)break;
       }
-      if(huntCancel)huntStatus.textContent=`Stopped · found ${found} using actual winners · checked ${checked.toLocaleString()} stored frames.`;
-      else if(found===wanted)huntStatus.textContent=`Found the next ${wanted} potentially winnable frames with your prize using actual race winners.`;
-      else huntStatus.textContent=`Checked ${checked.toLocaleString()} stored frames (${coverageStart.toLocaleString()}–${coverageEnd.toLocaleString()}) · found ${found} actual winning bet${found===1?'':'s'}. No predicted bets were used.`;
+      if(winningRaces.length){
+        found++;
+        const elapsed=initialWaitFrames+(frame-firstFrame+FRAME_CYCLE)%FRAME_CYCLE;
+        const row=document.createElement('li');
+        const frameLabel=document.createElement('strong');frameLabel.textContent=`Frame ${frame.toLocaleString()}`;
+        latestDiscoveredFrame=frame;
+        document.querySelector('#new-race-button').disabled=false;
+        huntFrameInput.value=String(frame);
+        const isGuess=winningRaces[0].course==='guess';
+        row.append(frameLabel,document.createTextNode(` · ${formatClock(frame)} · +${formatClock(elapsed)} after starting frame · Prize: ${PRIZE_NAMES[targetPrize]} · ${isGuess?'Best guess':'Actual winner'}`));
+        winningRaces.forEach(({course,winner_pair})=>{
+          const bet=document.createElement('span');bet.className='hunt-bet';
+          bet.textContent=course==='guess'?`~ ${winner_pair}`:`${course==='long'?'L':'S'} ${winner_pair}`;
+          bet.title=course==='guess'?'Best-guess pair from top speed and jockey rank; not confirmed by cached race results':`Actual ${course} race winning bet`;
+          row.append(bet);
+        });
+        huntResults.append(row);
+      }
+    }
+    if(checked>0&&checked%SEARCH_CONFIRM_INTERVAL===0&&checked<FRAME_CYCLE&&found<wanted){
+      huntStatus.textContent=`Paused after ${formatClock(checked)} of searching · ${found} potentially winnable frames found.`;
+      if(!confirmContinueSearch(checked,found)){pausedForConfirmation=true;break;}
+    }
+    if(performance.now()-batchStart>=14){
+      huntStatus.textContent=`${found}/${wanted} found · checked ${checked.toLocaleString()} frames · ${usedActual?'actual cached results':''}${usedActual&&usedBestGuess?' + ':''}${usedBestGuess?'best guesses':''}`;
+      await yieldFrame();batchStart=performance.now();
     }
   }
+  if(huntCancel)huntStatus.textContent=`Stopped · found ${found} · checked ${checked.toLocaleString()} frames${usedBestGuess?' including best guesses outside cached coverage':''}.`;
+  else if(pausedForConfirmation)huntStatus.textContent=`Paused at your request · found ${found} · checked ${checked.toLocaleString()} frames.`;
+  else if(found===wanted)huntStatus.textContent=`Found the next ${wanted} potentially winnable frames${usedBestGuess?' using actual winners where cached and best guesses elsewhere':''}.`;
+  else huntStatus.textContent=`Searched ${checked.toLocaleString()} frames · found ${found} potentially winnable bet${found===1?'':'s'}${usedActual?' using actual cached winners':''}${usedActual&&usedBestGuess?' and':''}${usedBestGuess?' using best guesses outside cached coverage':''}.`;
   huntRunning=false;huntRankSelect.disabled=huntPrizeSelect.disabled=huntFrameInput.disabled=document.querySelector('#hunt-step').disabled=false;
   huntButton.disabled=false;huntButton.textContent='Find next 10';
 });
