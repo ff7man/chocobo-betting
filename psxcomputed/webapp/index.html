@@ -66,10 +66,10 @@
 
         <section class="prize-hunt" aria-labelledby="prize-hunt-title">
           <h2 id="prize-hunt-title">Find Winnable Prize Frames</h2>
-          <p>Look ahead and predict when you should start the next race to get a chance at winning a desired prize</p>
-          <p class="database-coverage">Current actual-win coverage reaches about 7:01 after reset for Class C, 3:44 for B, 4:41 for A, and 5:29 for S. Results outside each class’s imported data range are unavailable.</p>
+          <p>Look ahead and find frames where the selected prize is on an actual winning bet.</p>
+          <p class="database-coverage">Uses recorded short and long race winners only. Current coverage is frames 600–215,998 (about the first hour after reset) for classes C, B, A, and S; frames without stored results are skipped, never guessed.</p>
           <div class="prize-hunt-controls">
-            <label>Starting frame<input id="hunt-frame" type="number" min="0" max="4194303" step="1" value="0" /></label>
+            <label>Starting frame<input id="hunt-frame" type="number" min="0" max="4294967295" step="1" value="0" /></label>
             <label>Class<select id="hunt-rank"><option value="C">C</option><option value="B" selected>B</option><option value="A">A</option><option value="S">S</option></select></label>
             <label>Target prize<select id="hunt-prize"></select></label>
             <label>Time before next try<select id="hunt-step"><option value="30">30 seconds</option><option value="45">45 seconds</option><option value="60" selected>60 seconds</option><option value="90">90 seconds</option><option value="120">120 seconds</option></select></label>
