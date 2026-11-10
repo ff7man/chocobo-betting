@@ -223,8 +223,8 @@ def main() -> None:
     with raw_path.open("wb") as output:
         min_seed = min(seed for _rank, seed, _course in records)
         frame_count = max_seed + 1 - min_seed
-        output.write(b"PSCDB2\0\0")
-        output.write(struct.pack("<IQ", min_seed, frame_count))
+        output.write(b"PSCDB3\0\0")
+        output.write(struct.pack("<I", min_seed))
         bit_buffer = 0
         buffered_bits = 0
         for seed in range(min_seed, max_seed + 1):
@@ -247,13 +247,10 @@ def main() -> None:
     raw_path.unlink()
 
     metadata = {
-        "format": "PSCDB2",
-        "version": 2,
+        "format": "PSCDB3",
+        "version": 3,
         "startSeed": min_seed,
-        "frameCount": frame_count,
         "headerStartSeedBits": 32,
-        "headerFrameCountBits": 64,
-        "maxSeedExclusive": max_seed + 1,
         "bitsPerFrame": BITS_PER_FRAME,
         "bitsPerPair": PAIR_BITS,
         "bitOrder": "little-endian; least-significant bits first",

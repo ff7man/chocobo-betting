@@ -54,7 +54,9 @@ before long course; Class C has no long-course entry. Each unordered pair is
 encoded as a 4-bit value (15 possible pairs, plus one unavailable marker), so
 the seven course results use 28 bits per frame. The old layout reserved six
 bytes per frame; the new layout omits unused Class C long-race slots and stores
-only what the bet grid needs. Finishing order is not retained. Names and stats
+only what the bet grid needs. Only the start frame is in the binary header;
+the frame count is inferred from the packed payload length. Finishing order is
+not retained. Names and stats
 are still generated from the seed by the frame finder. This database does not
 simulate finishes or infer missing winner data. Use DuckStation-generated
 records to extend coverage and replace historical results where they disagree.
