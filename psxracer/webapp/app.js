@@ -16,8 +16,8 @@ const AI_JOCKEY_COLORS=[
   {label:'Bronze',color:'#a96e3c'},
   {label:'Platinum',color:'#85878a'}
 ];
-// The game's frame counter appears to wrap at 0x400000 (2^22).
-const FRAME_CYCLE = 0x400000;
+// The PSX frame counter is an unsigned 32-bit value and wraps at 2^32.
+const FRAME_CYCLE = 0x100000000;
 const form = document.querySelector('#search-form');
 const rankSelect = document.querySelector('#rank');
 const speedSelect = document.querySelector('#speed');
@@ -443,19 +443,21 @@ async function requestEmulatorResults(frame,rank){
   }
 }
 async function scanFrom(start,criteria,rank){
+  const firstFrame=((Math.trunc(start)%FRAME_CYCLE)+FRAME_CYCLE)%FRAME_CYCLE;
   cancelSearch=false;searchButton.disabled=true;searchButton.setAttribute('aria-label','Searching');searchButton.textContent='…';cancelButton.hidden=false;
   keepSearchingButton.hidden=true;lastFoundFrame=null;
-  document.querySelector('#race-list').innerHTML='<div class="empty-state"><span class="empty-orbit">✳</span><strong>Scanning generated race data</strong><span>Starting at frame '+start.toLocaleString()+'</span></div>';
+  document.querySelector('#race-list').innerHTML='<div class="empty-state"><span class="empty-orbit">✳</span><strong>Scanning generated race data</strong><span>Starting at frame '+firstFrame.toLocaleString()+'</span></div>';
   const hasGiftFilters=criteria.prizes.some(prize=>prize!==null);
-  setBanner('searching','Searching from frame '+start.toLocaleString(),hasGiftFilters?'Checking chocobo details and selected gifts.':'Checking chocobo details; gifts will be filled from each match.');
-  let frame=start,attempts=0,found=null;
-  while(!cancelSearch && frame<FRAME_CYCLE) {
+  setBanner('searching','Searching from frame '+firstFrame.toLocaleString(),hasGiftFilters?'Checking chocobo details and selected gifts.':'Checking chocobo details; gifts will be filled from each match.');
+  let frame=firstFrame,attempts=0,found=null;
+  while(!cancelSearch&&attempts<FRAME_CYCLE) {
     const batchStart=performance.now();
     do {
+      frame=(firstFrame+attempts)%FRAME_CYCLE;
       const race=generateRaceData(frame,rank);
+      attempts++;
       if(matches(race,criteria)){found={race,frame};break;}
-      frame++;attempts++;
-    } while(performance.now()-batchStart<14 && !cancelSearch && frame<FRAME_CYCLE);
+    } while(performance.now()-batchStart<14&&!cancelSearch&&attempts<FRAME_CYCLE);
     if(found||cancelSearch)break;
     if(attempts>0&&attempts%2400<180) setBanner('searching',`${attempts.toLocaleString()} frames checked`,`Currently at frame ${frame.toLocaleString()} · ${formatClock(frame)} since reset.`);
     await yieldFrame();
@@ -469,14 +471,14 @@ async function scanFrom(start,criteria,rank){
     huntRankSelect.value=rank;
     updateHuntPrizes();
     found.race.items.forEach((item,index)=>{prizeSelects[index].value=String(item);syncCustomDropdown(prizeSelects[index]);});
-    lastFoundFrame=found.frame;keepSearchingButton.hidden=found.frame+1>=FRAME_CYCLE;
+    lastFoundFrame=found.frame;keepSearchingButton.hidden=false;
     setBanner('success','Race data matched',`${found.race.names[0]} · ${PRIZE_NAMES[found.race.items[0]]} / ${PRIZE_NAMES[found.race.items[1]]} / ${PRIZE_NAMES[found.race.items[2]]}`);
     await requestEmulatorResults(found.frame,rank);
   }
   else if(cancelSearch){setBanner('',`Search stopped`,`Checked ${attempts.toLocaleString()} frames. Adjust your start time or race details and try again.`);}
   else {
     document.querySelector('#race-list').innerHTML='<div class="empty-state"><strong>No matching frame found</strong><span>Check the PlayStation class, chocobo stats, prizes, and time since power reset.</span></div>';
-    setBanner('error','No match found',`Scanned ~${formatSearchEstimate(attempts)} · Check PS data.`);
+    setBanner('error','No match found',`Scanned the full 2^32-frame cycle (~${formatSearchEstimate(attempts)}). Check PS data.`);
   }
 }
 form.addEventListener('submit',event=>{
@@ -489,7 +491,7 @@ keepSearchingButton.addEventListener('click',()=>{
   if(lastFoundFrame===null)return;
   const criteria=collectCriteria();
   if(!confirmGiftSelection(criteria))return;
-  scanFrom(lastFoundFrame+1,criteria,rankSelect.value);
+  scanFrom((lastFoundFrame+1)%FRAME_CYCLE,criteria,rankSelect.value);
 });
 cancelButton.addEventListener('click',()=>{cancelSearch=true;cancelButton.disabled=true;cancelButton.textContent='Stopping…';setTimeout(()=>{cancelButton.disabled=false;cancelButton.textContent='Stop search';},200);});
 

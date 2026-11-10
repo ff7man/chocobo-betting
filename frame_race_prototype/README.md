@@ -4,7 +4,7 @@
 
 A small source patch for DuckStation that loads a selected FFVII Chocobo race frame, runs the race at unlimited speed, and reads the actual finish order from game memory. It can run headless and export full race results as JSON Lines. Class B, A, and S can run both course lengths; Class C is short-only.
 
-This is the emulator-side race runner. A frame finder such as [`psx/`](../psx/) can identify a candidate from observed chocobo stats, then this patch emulates that frame to confirm the real winners. Valid target frames are `0`–`4,194,303`.
+This is the emulator-side race runner. A frame finder such as [`psx/`](../psx/) can identify a candidate from observed chocobo stats, then this patch emulates that frame to confirm the real winners. Valid target frames cover the full unsigned 32-bit range, `0`–`4,294,967,295`, wrapping modulo `2^32`.
 
 ## Sample frame result
 
@@ -67,7 +67,7 @@ ExportPath=/tmp/chocobo-race-results.jsonl
 | --- | --- |
 | `Enabled` | Turns on the Chocobo runner patch. |
 | `StateFile` | Loads the class checkpoint (slots 2/3/4/5 for C/B/A/S). |
-| `UseTargetFrame` / `TargetFrame` | Uses the requested generator frame instead of legacy `FrameValue`; valid frames are `0`–`4,194,303`. |
+| `UseTargetFrame` / `TargetFrame` | Uses the requested generator frame instead of legacy `FrameValue`; valid frames are `0`–`4,294,967,295`. |
 | `FrameOffset` | `auto` subtracts 63 frames for C/B/A or 64 for S before writing the counter. A number overrides the correction. |
 | `CourseLengthWriteWidth` / `CourseLengthValue` | Writes the selector as one byte: `6` short, `0` long. |
 | `AutoRun` / `AutoStartDelayFrames` | Starts automatically after the betting screen loads and waits the configured frames (595 here). |
@@ -83,4 +83,4 @@ Run the build with an FFVII disc image (`.cue` or `.chd`):
 build/bin/duckstation-qt -nogui -batch -- "/path/to/Final Fantasy VII.cue"
 ```
 
-`FrameOffset=auto` subtracts `63` frames for Classes C/B/A and `64` for S, modulo the 4,194,304-frame counter cycle. Course value `6` selects short and `0` selects long. To run both courses, set `RunBothCourses=true` for B/A/S; Class C is short-only. The required game image, BIOS, and save states are supplied locally and are not included.
+`FrameOffset=auto` subtracts `63` frames for Classes C/B/A and `64` for S, using unsigned 32-bit wraparound. Course value `6` selects short and `0` selects long. To run both courses, set `RunBothCourses=true` for B/A/S; Class C is short-only. The required game image, BIOS, and save states are supplied locally and are not included.
