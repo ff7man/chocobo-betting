@@ -15,7 +15,12 @@ run `./run.sh` from this folder and open <http://127.0.0.1:8766>.
 ## Rebuild the database
 
 The binary database is in `webapp/data/winners.zip`; the browser unpacks it
-with the bundled JSZip library and keeps the decoded data in memory.
+with the bundled JSZip library and keeps the decoded data in memory. It stores
+only the unordered top-two bet pair for each available class and course, not
+the generated names or stats. The seven course pairs per frame use four bits
+each (28 bits total), ordered C/B/A/S with short before long; Class C has no
+long-course entry. Pair order is deliberately discarded because the UI only
+needs the bet tile.
 
 The full-hour race archives are in the repository-level `../data/` folder.
 Extract them to a temporary directory and pass that directory to the builder:
@@ -43,11 +48,16 @@ python3 build_db.py --input-dir ../ml \
   --prefer-later-input
 ```
 
-The packed database stores only the winning chocobo IDs (1–6): six bytes per
-frame for all four classes and both course lengths. A zero value means that
-course has no imported result. It does not simulate finishes or infer missing
-winner data. Use DuckStation-generated records to extend coverage and replace
-historical results where they disagree.
+The packed database stores only the top-two bet pair for each available class
+and course. Within each frame, entries are ordered C, B, A, S; short course
+before long course; Class C has no long-course entry. Each unordered pair is
+encoded as a 4-bit value (15 possible pairs, plus one unavailable marker), so
+the seven course results use 28 bits per frame. The old layout reserved six
+bytes per frame; the new layout omits unused Class C long-race slots and stores
+only what the bet grid needs. Finishing order is not retained. Names and stats
+are still generated from the seed by the frame finder. This database does not
+simulate finishes or infer missing winner data. Use DuckStation-generated
+records to extend coverage and replace historical results where they disagree.
 
 The game takes at least 10 seconds to load the betting screen, so the first 600
 frames after reset were intentionally omitted from the generated dataset. The

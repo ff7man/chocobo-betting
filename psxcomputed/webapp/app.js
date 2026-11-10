@@ -447,17 +447,19 @@ async function requestEmulatorResults(frame,rank){
     const {view,metadata}=await loadWinnerDatabase();
     const bytes=new Uint8Array(view.buffer,view.byteOffset,view.byteLength);
     const magic=String.fromCharCode(...bytes.slice(0,6));
-    if(magic!=='PSCDB1')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
-    const maxSeedExclusive=view.getUint32(8,true);
-    if(frame<0||frame>=maxSeedExclusive)throw new Error(`Frame ${frame.toLocaleString()} is outside the current database (0–${(maxSeedExclusive-1).toLocaleString()}).`);
-    const rankIndex={C:0,B:1,A:2,S:3}[rank];
-    const rankBit=rankIndex*12;
-    const byteOffset=12+frame*6+Math.floor(rankBit/8);
-    const word=((bytes[byteOffset]|(bytes[byteOffset+1]<<8))>>>(rankBit%8))&0xFFF;
+    if(magic!=='PSCDB2')throw new Error('Winner database has an unknown format. Rebuild it with build_db.py.');
+    const startSeed=view.getUint32(8,true),frameCount=Number(view.getBigUint64(12,true));
+    const maxSeedExclusive=startSeed+frameCount;
+    if(frame<startSeed||frame>=maxSeedExclusive)throw new Error(`Frame ${frame.toLocaleString()} is outside the current database (${startSeed.toLocaleString()}–${(maxSeedExclusive-1).toLocaleString()}).`);
+    const rankCourseIndex={C:{short:0},B:{short:1,long:2},A:{short:3,long:4},S:{short:5,long:6}};
     const races=[];
-    for(const [course,shift] of [['long',0],['short',6]]){
-      const first=(word>>shift)&7, second=(word>>(shift+3))&7;
-      if(first&&second)races.push({course,winner_pair:`${first}-${second}`});
+    for(const course of ['short','long']){
+      const courseIndex=rankCourseIndex[rank][course];
+      if(courseIndex===undefined)continue;
+      const bitOffset=(frame-startSeed)*28+courseIndex*4;
+      const byteOffset=20+Math.floor(bitOffset/8),bitShift=bitOffset%8;
+      const pairCode=((bytes[byteOffset]|(bytes[byteOffset+1]<<8))>>>bitShift)&0xF;
+      if(pairCode!==0xF)races.push({course,winner_pair:BET_PAIRS[pairCode]});
     }
     document.querySelectorAll('.race-course-marks').forEach(marks=>marks.remove());
     const summary=[];
